@@ -81,6 +81,7 @@ impl Config {
         }
     }
 
+    #[allow(dead_code)] // Only used by tursodb, not pgmicro
     pub fn for_output_mode(mode: OutputMode) -> Self {
         let table = if mode == OutputMode::Pretty {
             TableConfig::adaptive_colors()

@@ -57,6 +57,10 @@ use crate::{
         datetime::{
             exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
+        postgres::{
+            exec_lpad, exec_pg_encoding_to_char, exec_pg_format_type, exec_pg_get_constraintdef,
+            exec_pg_get_indexdef, exec_pg_get_user_by_id, exec_pg_is_visible, exec_rpad,
+        },
         printf::exec_printf,
     },
     stats::StatAccum,
@@ -173,7 +177,6 @@ macro_rules! check_arg_count {
 pub type InsnFunction =
     fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> Result<InsnFunctionStepResult>;
 
-/// Parse a Value (text, int, float, or blob) into a BigDecimal.
 fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
     use bigdecimal::BigDecimal;
     use std::str::FromStr;
@@ -6471,6 +6474,98 @@ pub fn op_function(
                     }
                 }
             }
+            ScalarFunc::PgGetUserById => {
+                let oid = state.registers[*start_reg]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                state.registers[*dest].set_value(exec_pg_get_user_by_id(oid));
+            }
+            ScalarFunc::PgTableIsVisible
+            | ScalarFunc::PgFunctionIsVisible
+            | ScalarFunc::PgTypeIsVisible => {
+                let oid = state.registers[*start_reg]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                state.registers[*dest].set_value(exec_pg_is_visible(oid));
+            }
+            ScalarFunc::PgGetExpr
+            | ScalarFunc::PgGetStatisticsObjDefColumns
+            | ScalarFunc::PgRelationIsPublishable
+            | ScalarFunc::PgGetFunctionResult
+            | ScalarFunc::PgGetFunctionArguments => {
+                state.registers[*dest].set_value(Value::Null);
+            }
+            ScalarFunc::PgGetConstraintDef => {
+                let oid = state.registers[*start_reg]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                state.registers[*dest]
+                    .set_value(exec_pg_get_constraintdef(&program.connection, oid));
+            }
+            ScalarFunc::PgGetIndexDef => {
+                let oid = state.registers[*start_reg]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                state.registers[*dest].set_value(exec_pg_get_indexdef(&program.connection, oid));
+            }
+            ScalarFunc::PgEncodingToChar => {
+                let encoding = state.registers[*start_reg]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                state.registers[*dest].set_value(exec_pg_encoding_to_char(encoding));
+            }
+            ScalarFunc::PgFormatType => {
+                let type_oid = state.registers[*start_reg]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                let typemod = if arg_count > 1 {
+                    state.registers[*start_reg + 1]
+                        .get_value()
+                        .as_int()
+                        .unwrap_or(-1)
+                } else {
+                    -1
+                };
+                state.registers[*dest].set_value(exec_pg_format_type(type_oid, typemod));
+            }
+            ScalarFunc::Lpad => {
+                let input = state.registers[*start_reg].get_value();
+                let length = state.registers[*start_reg + 1]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0) as usize;
+                let fill = if arg_count > 2 {
+                    match &state.registers[*start_reg + 2] {
+                        Register::Value(Value::Text(s)) => s.to_string(),
+                        _ => " ".to_string(),
+                    }
+                } else {
+                    " ".to_string()
+                };
+                state.registers[*dest].set_value(exec_lpad(input, length, &fill));
+            }
+            ScalarFunc::Rpad => {
+                let input = state.registers[*start_reg].get_value();
+                let length = state.registers[*start_reg + 1]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0) as usize;
+                let fill = if arg_count > 2 {
+                    match &state.registers[*start_reg + 2] {
+                        Register::Value(Value::Text(s)) => s.to_string(),
+                        _ => " ".to_string(),
+                    }
+                } else {
+                    " ".to_string()
+                };
+                state.registers[*dest].set_value(exec_rpad(input, length, &fill));
+            }
             ScalarFunc::Abs
             | ScalarFunc::Lower
             | ScalarFunc::Upper
@@ -10209,7 +10304,9 @@ pub fn op_parse_schema(
     } else {
         format!("SELECT * FROM {schema_table}")
     };
-    let stmt = conn.prepare(sql)?;
+    // Use prepare_internal to always use the SQLite parser for these internal queries,
+    // regardless of the user-facing SQL dialect (e.g. PostgreSQL mode).
+    let stmt = conn.prepare_internal(&sql)?;
 
     // Get a mutable schema clone *without* holding the schema lock during
     // nested statement execution.  The nested Statement may call reprepare()

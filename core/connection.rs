@@ -17,12 +17,12 @@ use crate::{
     io::{MemoryIO, IO},
     parse_schema_rows, refresh_analyze_stats, translate,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
-    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
-    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
-    Value, VirtualTable,
+    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSqlDialect, AtomicSyncMode, AtomicTempStore,
+    BusyHandler, BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult,
+    CipherMode, Cmd, Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts,
+    Duration, EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
+    Pager, Parser, QueryMode, QueryRunner, Result, Schema, SqlDialect, Statement, SyncMode,
+    TransactionMode, Trigger, Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -111,6 +111,7 @@ pub struct Connection {
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
+    pub(super) sql_dialect: AtomicSqlDialect,
     pub(super) data_sync_retry: AtomicBool,
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
@@ -124,6 +125,8 @@ pub struct Connection {
     pub(crate) n_active_writes: AtomicI32,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
+    /// Per-connection override for custom types (set when switching to PG dialect)
+    pub(super) custom_types_override: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
     /// Generation counter bumped whenever any setting that affects PrepareContext
@@ -265,8 +268,125 @@ impl Connection {
         );
         self.executing_triggers.write().pop();
     }
+
+    /// Parse SQL using the appropriate parser based on the current sql_dialect setting
+    /// Returns the parsed command and the number of bytes consumed
+    fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        match self.get_sql_dialect() {
+            SqlDialect::Sqlite => {
+                let mut parser = Parser::new(sql.as_bytes());
+                let cmd = parser.next_cmd()?;
+                let offset = parser.offset();
+                Ok((cmd, offset))
+            }
+            SqlDialect::Postgres => {
+                let cmd = self.parse_postgresql_sql(sql)?;
+                // For PostgreSQL, we consume the entire input
+                Ok((cmd, sql.len()))
+            }
+        }
+    }
+
+    /// Parse PostgreSQL SQL using pg_query and translate to Turso AST
+    pub(crate) fn parse_postgresql_sql(&self, sql: &str) -> Result<Option<Cmd>> {
+        // Parse using pg_query
+        let parse_result = turso_parser_pg::parse(sql)
+            .map_err(|e| LimboError::ParseError(format!("PostgreSQL parse error: {e}")))?;
+
+        // Translate to Turso AST
+        let translator = turso_parser_pg::translator::PostgreSQLTranslator::new();
+        let stmt = translator
+            .translate(&parse_result)
+            .map_err(|e| LimboError::ParseError(format!("PostgreSQL translation error: {e}")))?;
+
+        // Wrap in Cmd
+        Ok(Some(Cmd::Stmt(stmt)))
+    }
+
+    /// Handle PG session/schema commands that need connection state.
+    /// Handles: SET (→ PRAGMA), SHOW (→ PRAGMA), CREATE/DROP SCHEMA.
+    /// Returns Some(Statement) if handled, None to fall through to standard parse path.
+    pub(crate) fn try_prepare_pg(self: &Arc<Self>, sql: &str) -> Result<Option<Statement>> {
+        use turso_parser_pg::translator::{
+            try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
+        };
+
+        // If pg_query can't parse the SQL, return None to fall through.
+        let parse_result = match turso_parser_pg::parse(sql) {
+            Ok(result) => result,
+            Err(_) => return Ok(None),
+        };
+
+        // SET name = value → PRAGMA name = value
+        if let Some(set_stmt) = try_extract_set(&parse_result) {
+            let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, set_stmt.value);
+            return Ok(Some(self.prepare_sqlite_sql(&pragma_sql)?));
+        }
+
+        // SHOW name → PRAGMA name
+        if let Some(show_stmt) = try_extract_show(&parse_result) {
+            let pragma_sql = format!("PRAGMA {}", show_stmt.name);
+            return Ok(Some(self.prepare_sqlite_sql(&pragma_sql)?));
+        }
+
+        // CREATE SCHEMA → ATTACH database
+        if let Some(cs) = try_extract_create_schema(&parse_result) {
+            self.handle_pg_create_schema(&cs)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
+        // DROP SCHEMA → DROP tables + DETACH database
+        if let Some(ds) = try_extract_drop_schema(&parse_result) {
+            self.handle_pg_drop_schema(&ds)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
+        Ok(None)
+    }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self._prepare(sql)
+    }
+
+    /// Prepare a statement using the SQLite parser, regardless of connection dialect.
+    /// Used for internal queries (e.g. ParseSchema) that operate on SQLite internals
+    /// and must not be affected by the user-facing SQL dialect setting.
+    /// Parse SQL with the SQLite parser without changing the connection dialect.
+    /// Used for SET/SHOW → PRAGMA translation where the current dialect must be
+    /// preserved (PRAGMAs like sql_dialect read the dialect at compile time).
+    fn prepare_sqlite_sql(self: &Arc<Self>, sql: &str) -> Result<Statement> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd()?;
+        let byte_offset_end = parser.offset();
+        let syms = self.syms.read();
+        let cmd = cmd.expect("Internal SQL should always produce a command");
+        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+            .unwrap()
+            .trim();
+        self.maybe_update_schema();
+        let pager = self.pager.load().clone();
+        let mode = QueryMode::new(&cmd);
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let schema = self.schema.read().clone();
+        let program = translate::translate(
+            &schema,
+            stmt,
+            pager.clone(),
+            self.clone(),
+            &syms,
+            mode,
+            input,
+        )?;
+        Ok(Statement::new(program, pager, mode, 0))
+    }
+
+    pub fn prepare_internal(self: &Arc<Self>, sql: &str) -> Result<Statement> {
+        // Temporarily force SQLite dialect so the planner doesn't hide internal
+        // tables like sqlite_schema when the connection is in Postgres mode.
+        let saved_dialect = self.get_sql_dialect();
+        self.set_sql_dialect(SqlDialect::Sqlite);
+        let result = self._prepare(sql);
+        self.set_sql_dialect(saved_dialect);
+        result
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -282,8 +402,17 @@ impl Connection {
 
         let sql = sql.as_ref();
         tracing::debug!("Preparing: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = match parser.next_cmd()? {
+
+        // For PG dialect, try PG-specific path first (CREATE TABLE, SET, SHOW, etc.)
+        if self.get_sql_dialect() == SqlDialect::Postgres {
+            if let Some(stmt) = self.try_prepare_pg(sql)? {
+                return Ok(stmt);
+            }
+        }
+
+        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
+        let syms = self.syms.read();
+        let cmd = match cmd {
             Some(cmd) => cmd,
             None => {
                 return Err(LimboError::InvalidArgument(
@@ -291,8 +420,6 @@ impl Connection {
                 ));
             }
         };
-        let syms = self.syms.read();
-        let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
@@ -515,11 +642,20 @@ impl Connection {
         self.maybe_update_schema();
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        while let Some(cmd) = parser.next_cmd()? {
+
+        // For PG dialect, try session commands first (SET, SHOW, schema ops)
+        if self.get_sql_dialect() == SqlDialect::Postgres {
+            if let Some(mut stmt) = self.try_prepare_pg(sql)? {
+                stmt.run_ignore_rows()?;
+                return Ok(());
+            }
+        }
+
+        // Unified path: parse_sql routes to the right parser by dialect
+        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
+        if let Some(cmd) = cmd {
             let syms = self.syms.read();
             let pager = self.pager.load().clone();
-            let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
@@ -535,7 +671,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -548,9 +684,15 @@ impl Connection {
         let sql = sql.as_ref();
         self.maybe_update_schema();
         tracing::trace!("Querying: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
-        let byte_offset_end = parser.offset();
+
+        // For PG dialect, try session commands first (SET, SHOW, schema ops)
+        if self.get_sql_dialect() == SqlDialect::Postgres {
+            if let Some(stmt) = self.try_prepare_pg(sql)? {
+                return Ok(Some(stmt));
+            }
+        }
+
+        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
@@ -600,6 +742,40 @@ impl Connection {
         }
         let sql = sql.as_ref();
         self.maybe_update_schema();
+
+        // For PG dialect, try session commands first (SET, SHOW, schema ops)
+        if self.get_sql_dialect() == SqlDialect::Postgres {
+            if let Some(mut stmt) = self.try_prepare_pg(sql)? {
+                stmt.run_ignore_rows()?;
+                return Ok(());
+            }
+            // PG path: single statement (multi-statement splitting is handled
+            // by the PG wire layer's split_statements)
+            let (cmd, byte_offset_end) = self.parse_sql(sql)?;
+            if let Some(cmd) = cmd {
+                let syms = self.syms.read();
+                let pager = self.pager.load().clone();
+                let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                    .unwrap()
+                    .trim();
+                let mode = QueryMode::new(&cmd);
+                let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                let schema = self.schema.read().clone();
+                let program = translate::translate(
+                    &schema,
+                    stmt,
+                    pager.clone(),
+                    self.clone(),
+                    &syms,
+                    mode,
+                    input,
+                )?;
+                Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+            }
+            return Ok(());
+        }
+
+        // SQLite path: loop to handle multiple semicolon-separated statements
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let syms = self.syms.read();
@@ -620,7 +796,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -630,13 +806,12 @@ impl Connection {
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, usize)>> {
-        let mut parser = Parser::new(sql.as_ref().as_bytes());
-        let Some(cmd) = parser.next_cmd()? else {
+        let (cmd, byte_offset_end) = self.parse_sql(sql.as_ref())?;
+        let Some(cmd) = cmd else {
             return Ok(None);
         };
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
-        let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
@@ -653,7 +828,7 @@ impl Connection {
             input,
         )?;
         let stmt = Statement::new(program, pager, mode, 0);
-        Ok(Some((stmt, parser.offset())))
+        Ok(Some((stmt, byte_offset_end)))
     }
 
     #[cfg(feature = "fs")]
@@ -1367,6 +1542,9 @@ impl Connection {
 
     pub fn experimental_custom_types_enabled(&self) -> bool {
         self.db.experimental_custom_types_enabled()
+            || self
+                .custom_types_override
+                .load(crate::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {
@@ -1375,6 +1553,10 @@ impl Connection {
 
     pub fn experimental_generated_columns_enabled(&self) -> bool {
         self.db.experimental_generated_columns_enabled()
+    }
+
+    pub fn experimental_postgres_enabled(&self) -> bool {
+        self.db.experimental_postgres_enabled()
     }
 
     pub fn mvcc_enabled(&self) -> bool {
@@ -1491,6 +1673,107 @@ impl Connection {
         }
     }
 
+    /// Handle CREATE SCHEMA in PostgreSQL mode.
+    /// Maps to ATTACH with an in-memory database.
+    /// File-backed persistence (turso-postgres-schema-<name>.db) is handled by the CLI layer.
+    fn handle_pg_create_schema(
+        self: &Arc<Self>,
+        stmt: &turso_parser_pg::translator::PgCreateSchemaStmt,
+    ) -> Result<()> {
+        let name = stmt.name.to_lowercase();
+        if name == "public" {
+            // "public" always exists
+            if stmt.if_not_exists {
+                return Ok(());
+            }
+            return Err(LimboError::ParseError(format!(
+                "schema \"{name}\" already exists"
+            )));
+        }
+        if self.is_attached(&name) {
+            if stmt.if_not_exists {
+                return Ok(());
+            }
+            return Err(LimboError::ParseError(format!(
+                "schema \"{name}\" already exists"
+            )));
+        }
+        self.attach_database(":memory:", &name)
+    }
+
+    /// Handle DROP SCHEMA in PostgreSQL mode.
+    /// For "public": drops all user tables from main DB.
+    /// For other schemas: drops all tables, then DETACHes.
+    fn handle_pg_drop_schema(
+        self: &Arc<Self>,
+        stmt: &turso_parser_pg::translator::PgDropSchemaStmt,
+    ) -> Result<()> {
+        let name = stmt.name.to_lowercase();
+        if name == "public" {
+            return self.handle_pg_drop_schema_public(stmt.cascade);
+        }
+        if !self.is_attached(&name) {
+            if stmt.if_exists {
+                return Ok(());
+            }
+            return Err(LimboError::ParseError(format!(
+                "schema \"{name}\" does not exist"
+            )));
+        }
+        if stmt.cascade {
+            self.drop_all_tables_in_schema(&name)?;
+        }
+        self.detach_database(&name)
+    }
+
+    /// Drop all user tables in the main ("public") schema.
+    fn handle_pg_drop_schema_public(self: &Arc<Self>, cascade: bool) -> Result<()> {
+        let table_names = self.list_user_tables(None)?;
+        if !cascade && !table_names.is_empty() {
+            return Err(LimboError::ParseError(
+                "cannot drop schema \"public\" because other objects depend on it".to_string(),
+            ));
+        }
+        for table_name in table_names {
+            let sql = format!("DROP TABLE \"{table_name}\"");
+            let mut stmt = self.prepare_internal(&sql)?;
+            stmt.run_ignore_rows()?;
+        }
+        Ok(())
+    }
+
+    /// Drop all tables in an attached schema.
+    fn drop_all_tables_in_schema(self: &Arc<Self>, schema_name: &str) -> Result<()> {
+        let table_names = self.list_user_tables(Some(schema_name))?;
+        for table_name in table_names {
+            let sql = format!("DROP TABLE \"{schema_name}\".\"{table_name}\"");
+            let mut stmt = self.prepare_internal(&sql)?;
+            stmt.run_ignore_rows()?;
+        }
+        Ok(())
+    }
+
+    /// List user-visible table names in a schema.
+    /// If schema_name is None, queries main DB's sqlite_schema.
+    /// If schema_name is Some(name), queries name.sqlite_schema.
+    fn list_user_tables(self: &Arc<Self>, schema_name: Option<&str>) -> Result<Vec<String>> {
+        let sql = match schema_name {
+            Some(name) => format!(
+                "SELECT name FROM \"{name}\".sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ),
+            None => "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'".to_string(),
+        };
+        let mut stmt = self.prepare_internal(&sql)?;
+        let rows = stmt.run_collect_rows()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Text(t)) => Some(t.as_str().to_string()),
+                _ => None,
+            })
+            .collect())
+    }
+
     #[cfg(feature = "fs")]
     fn is_attached(&self, alias: &str) -> bool {
         self.attached_databases
@@ -1529,10 +1812,12 @@ impl Connection {
 
         let use_views = self.db.experimental_views_enabled();
         let use_custom_types = self.db.experimental_custom_types_enabled();
+        let use_postgres = self.db.experimental_postgres_enabled();
 
         let db_opts = DatabaseOpts::new()
             .with_views(use_views)
-            .with_custom_types(use_custom_types);
+            .with_custom_types(use_custom_types)
+            .with_postgres(use_postgres);
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also
@@ -1820,6 +2105,19 @@ impl Connection {
 
     pub fn set_temp_store(&self, value: crate::TempStore) {
         self.temp_store.set(value);
+    }
+
+    pub fn get_sql_dialect(&self) -> SqlDialect {
+        self.sql_dialect.get()
+    }
+
+    pub fn set_sql_dialect(&self, dialect: SqlDialect) {
+        self.sql_dialect.set(dialect);
+    }
+
+    pub fn enable_custom_types(&self) {
+        self.custom_types_override
+            .store(true, crate::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn get_data_sync_retry(&self) -> bool {

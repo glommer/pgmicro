@@ -401,6 +401,8 @@ pub struct Schema {
     pub type_registry: HashMap<String, Arc<TypeDef>>,
 
     pub generated_columns_enabled: bool,
+    /// PostgreSQL catalog tables (only visible in PostgreSQL dialect)
+    pub postgres_catalog_tables: HashMap<String, Arc<Table>>,
 }
 
 impl Default for Schema {
@@ -423,11 +425,15 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
         "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
         "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
-        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE time(value) END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE datetime(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE strftime('%H:%M:%f', value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE strftime('%Y-%m-%d %H:%M:%f', value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE strftime('%Y-%m-%d %H:%M:%f', value) END DECODE value OPERATOR '<'",
         "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
         "CREATE TYPE bigint(value integer) BASE integer",
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
+        "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",
+        "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
+        "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
         "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
     ];
@@ -478,6 +484,12 @@ impl Schema {
                 Arc::new(Table::Virtual(Arc::new((*function).clone()))),
             );
         }
+        // PostgreSQL catalog tables are registered separately
+        let postgres_catalog_tables: HashMap<String, Arc<Table>> =
+            VirtualTable::postgres_catalog_tables()
+                .into_iter()
+                .map(|vtab| (vtab.name.clone(), Arc::new(Table::Virtual(vtab))))
+                .collect();
         let materialized_view_names = HashSet::default();
         let materialized_view_sql = HashMap::default();
         let incremental_views = HashMap::default();
@@ -507,6 +519,7 @@ impl Schema {
                 registry
             },
             generated_columns_enabled: false,
+            postgres_catalog_tables,
         }
     }
 
@@ -819,6 +832,21 @@ impl Schema {
             &name
         };
         self.tables.get(name).cloned()
+    }
+
+    /// Look up a table in the PostgreSQL catalog (pg_class, pg_namespace, etc.)
+    pub fn get_postgres_table(&self, name: &str) -> Option<Arc<Table>> {
+        let name = normalize_ident(name);
+        self.postgres_catalog_tables.get(&name).cloned()
+    }
+
+    /// Check if a table name is SQLite-specific and should be hidden in other dialects
+    pub fn is_sqlite_specific_table(name: &str) -> bool {
+        name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME)
+            || name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT)
+            || name.starts_with("pragma_")
+            || name.starts_with("json_")
+            || name.eq_ignore_ascii_case("sqlite_dbpage")
     }
 
     pub fn remove_table(&mut self, table_name: &str) {
@@ -1896,6 +1924,7 @@ impl Clone for Schema {
             dropped_root_pages: self.dropped_root_pages.clone(),
             type_registry: self.type_registry.clone(),
             generated_columns_enabled: self.generated_columns_enabled,
+            postgres_catalog_tables: self.postgres_catalog_tables.clone(),
         }
     }
 }

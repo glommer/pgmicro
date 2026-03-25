@@ -30,6 +30,22 @@ pub struct VirtualTable {
 }
 
 impl VirtualTable {
+    pub(crate) fn new_internal(
+        name: String,
+        sql: String,
+        kind: VTabKind,
+        table: Arc<RwLock<dyn InternalVirtualTable>>,
+    ) -> crate::Result<Self> {
+        Ok(VirtualTable {
+            name,
+            columns: Self::resolve_columns(sql)?,
+            kind,
+            vtab_type: VirtualTableType::Internal(table),
+            vtab_id: 0,
+            innocuous: true,
+        })
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.vtab_id
     }
@@ -83,6 +99,10 @@ impl VirtualTable {
             innocuous: true,
         };
         Arc::new(vtab)
+    }
+
+    pub(crate) fn postgres_catalog_tables() -> Vec<Arc<VirtualTable>> {
+        crate::pg_catalog::pg_catalog_virtual_tables()
     }
 
     pub(crate) fn builtin_functions(enable_custom_types: bool) -> Vec<Arc<VirtualTable>> {

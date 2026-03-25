@@ -27,6 +27,7 @@ members = [
     "testing/sqlite_test_ext",
     "tests",
     "parser",
+    "parser_pg",
     "sync/engine",
     "sync/sdk-kit",
     "sql_generation",
@@ -63,6 +64,7 @@ turso_sync_engine = { path = "sync/engine", version = "0.6.0-pre.7" }
 turso_ext = { path = "extensions/core", version = "0.6.0-pre.7" }
 turso_macros = { path = "macros", version = "0.6.0-pre.7" }
 turso_parser = { path = "parser", version = "0.6.0-pre.7" }
+turso_parser_pg = { path = "parser_pg", version = "0.1.0" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }

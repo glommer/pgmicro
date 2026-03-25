@@ -396,6 +396,7 @@ mod tests {
                 enable_attach: false,
                 enable_generated_columns: false,
                 unsafe_testing: false,
+                enable_postgres: false,
             },
             None,
         )?;

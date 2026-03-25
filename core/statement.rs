@@ -482,6 +482,30 @@ impl Statement {
         }
     }
 
+    /// Returns the number of array dimensions for a result column.
+    /// Returns `None` if the column is not a table column, or `Some(0)` for scalar columns.
+    pub fn get_column_array_dimensions(&self, idx: usize) -> Option<u32> {
+        if self.query_mode != QueryMode::Normal {
+            return None;
+        }
+        let column = &self.program.result_columns.get(idx)?;
+        match &column.expr {
+            turso_parser::ast::Expr::Column {
+                table,
+                column: column_idx,
+                ..
+            } => {
+                let (_, table_ref) = self
+                    .program
+                    .table_references
+                    .find_table_by_internal_id(*table)?;
+                let table_column = table_ref.get_column_at(*column_idx)?;
+                Some(table_column.array_dimensions())
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").
     ///
     /// Unlike `get_column_decltype` which returns the original declared type string,
@@ -525,6 +549,29 @@ impl Statement {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Returns the inferred type affinity name for a result column by examining
+    /// the column expression. Unlike `get_column_decltype` which only works for
+    /// table columns, this works for arbitrary expressions (CAST, function calls,
+    /// literals, etc.) by inferring the type from the expression structure.
+    pub fn get_column_inferred_type(&self, idx: usize) -> Option<String> {
+        if self.query_mode != QueryMode::Normal {
+            return None;
+        }
+        let column = &self.program.result_columns.get(idx)?;
+        let affinity = translate::expr::get_expr_affinity(
+            &column.expr,
+            Some(&self.program.table_references),
+            None,
+        );
+        match affinity {
+            crate::vdbe::affinity::Affinity::Integer => Some("INTEGER".to_string()),
+            crate::vdbe::affinity::Affinity::Real => Some("REAL".to_string()),
+            crate::vdbe::affinity::Affinity::Text => Some("TEXT".to_string()),
+            crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC".to_string()),
+            crate::vdbe::affinity::Affinity::Blob => None, // Blob means "no affinity"
         }
     }
 

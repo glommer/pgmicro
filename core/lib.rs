@@ -38,6 +38,7 @@ mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 mod parameters;
+mod pg_catalog;
 mod pragma;
 mod pseudo;
 mod regexp;
@@ -174,6 +175,7 @@ pub struct DatabaseOpts {
     pub enable_attach: bool,
     pub enable_generated_columns: bool,
     pub unsafe_testing: bool,
+    pub enable_postgres: bool,
     enable_load_extension: bool,
 }
 
@@ -227,6 +229,11 @@ impl DatabaseOpts {
         self.unsafe_testing = enable;
         self
     }
+
+    pub fn with_postgres(mut self, enable: bool) -> Self {
+        self.enable_postgres = enable;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -261,6 +268,16 @@ pub enum TempStore {
     Default = 0,
     File = 1,
     Memory = 2,
+}
+
+/// Control SQL parsing dialect.
+/// - 0 = SQLite (default)
+/// - 1 = PostgreSQL
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SqlDialect {
+    #[default]
+    Sqlite = 0,
+    Postgres = 1,
 }
 
 pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock>;
@@ -1374,6 +1391,7 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             temp_store: AtomicTempStore::new(TempStore::Default),
+            sql_dialect: AtomicSqlDialect::new(SqlDialect::Sqlite),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
@@ -1381,6 +1399,7 @@ impl Database {
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
+            custom_types_override: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             prepare_context_generation: AtomicU64::new(0),
         });
@@ -1656,6 +1675,10 @@ impl Database {
         self.opts.enable_generated_columns
     }
 
+    pub fn experimental_postgres_enabled(&self) -> bool {
+        self.opts.enable_postgres
+    }
+
     /// check if database is currently in MVCC mode
     pub fn mvcc_enabled(&self) -> bool {
         self.mv_store.load().is_some()
@@ -1917,20 +1940,91 @@ impl DatabaseCatalog {
     }
 }
 
+/// Dialect-aware query runner that iterates over statements in a SQL string.
+/// In SQLite mode, uses the SQLite Parser for statement splitting.
+/// In PG mode, uses pg_query for statement splitting and translation.
 pub struct QueryRunner<'a> {
-    parser: Parser<'a>,
     conn: &'a Arc<Connection>,
-    statements: &'a [u8],
-    last_offset: usize,
+    inner: QueryRunnerInner<'a>,
+}
+
+enum QueryRunnerInner<'a> {
+    Sqlite {
+        parser: Parser<'a>,
+        statements: &'a [u8],
+        last_offset: usize,
+    },
+    Postgres {
+        stmts: Vec<String>,
+        index: usize,
+    },
 }
 
 impl<'a> QueryRunner<'a> {
     pub(crate) fn new(conn: &'a Arc<Connection>, statements: &'a [u8]) -> Self {
-        Self {
-            parser: Parser::new(statements),
-            conn,
+        let inner = match conn.get_sql_dialect() {
+            SqlDialect::Sqlite => QueryRunnerInner::Sqlite {
+                parser: Parser::new(statements),
+                statements,
+                last_offset: 0,
+            },
+            SqlDialect::Postgres => {
+                let sql = str::from_utf8(statements).unwrap_or("");
+                let stmts = turso_parser_pg::split_statements(sql).unwrap_or_default();
+                QueryRunnerInner::Postgres { stmts, index: 0 }
+            }
+        };
+        Self { conn, inner }
+    }
+
+    fn next_sqlite(&mut self) -> Option<Result<Option<Statement>>> {
+        let QueryRunnerInner::Sqlite {
+            parser,
             statements,
-            last_offset: 0,
+            last_offset,
+        } = &mut self.inner
+        else {
+            unreachable!()
+        };
+
+        match parser.next_cmd() {
+            Ok(Some(cmd)) => {
+                let byte_offset_end = parser.offset();
+                let input = str::from_utf8(&statements[*last_offset..byte_offset_end])
+                    .unwrap()
+                    .trim();
+                *last_offset = byte_offset_end;
+                Some(self.conn.run_cmd(cmd, input))
+            }
+            Ok(None) => None,
+            Err(err) => Some(Result::Err(LimboError::from(err))),
+        }
+    }
+
+    fn next_pg(&mut self) -> Option<Result<Option<Statement>>> {
+        let QueryRunnerInner::Postgres { stmts, index } = &mut self.inner else {
+            unreachable!()
+        };
+
+        if *index >= stmts.len() {
+            return None;
+        }
+
+        let sql = &stmts[*index];
+        *index += 1;
+
+        // Try session commands (SET, SHOW, CREATE/DROP SCHEMA)
+        match self.conn.try_prepare_pg(sql) {
+            Ok(Some(stmt)) => return Some(Ok(Some(stmt))),
+            Ok(None) => {}
+            Err(e) => return Some(Err(e)),
+        }
+
+        // Parse and translate through the standard PG path
+        match self.conn.parse_postgresql_sql(sql) {
+            Ok(Some(cmd)) => Some(self.conn.run_cmd(cmd, sql)),
+            Ok(None) => Some(Ok(None)),
+            Err(e) => Some(Err(e)),
         }
     }
 }
@@ -1939,17 +2033,9 @@ impl Iterator for QueryRunner<'_> {
     type Item = Result<Option<Statement>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.parser.next_cmd() {
-            Ok(Some(cmd)) => {
-                let byte_offset_end = self.parser.offset();
-                let input = str::from_utf8(&self.statements[self.last_offset..byte_offset_end])
-                    .unwrap()
-                    .trim();
-                self.last_offset = byte_offset_end;
-                Some(self.conn.run_cmd(cmd, input))
-            }
-            Ok(None) => None,
-            Err(err) => Some(Result::Err(LimboError::from(err))),
+        match &self.inner {
+            QueryRunnerInner::Sqlite { .. } => self.next_sqlite(),
+            QueryRunnerInner::Postgres { .. } => self.next_pg(),
         }
     }
 }

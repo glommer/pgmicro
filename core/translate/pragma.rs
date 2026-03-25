@@ -445,6 +445,34 @@ fn update_pragma(
             connection.set_encryption_cipher(cipher)?;
             Ok(TransactionMode::None)
         }
+        PragmaName::SqlDialect => {
+            let dialect_str = match value {
+                Expr::Name(name) => name.as_str().to_lowercase(),
+                Expr::Literal(Literal::String(s)) => s.to_lowercase(),
+                _ => parse_string(&value)?.to_lowercase(),
+            };
+
+            let dialect = match dialect_str.as_str() {
+                "sqlite" => crate::SqlDialect::Sqlite,
+                "postgres" | "postgresql" => {
+                    if !connection.experimental_postgres_enabled() {
+                        bail_parse_error!(
+                            "PostgreSQL dialect is an experimental feature. Enable with --experimental-postgres flag"
+                        );
+                    }
+                    crate::SqlDialect::Postgres
+                }
+                _ => {
+                    bail_parse_error!("Invalid SQL dialect. Supported values: 'sqlite', 'postgres'")
+                }
+            };
+
+            connection.set_sql_dialect(dialect);
+            if dialect == crate::SqlDialect::Postgres {
+                connection.enable_custom_types();
+            }
+            Ok(TransactionMode::None)
+        }
         PragmaName::Synchronous => {
             use crate::SyncMode;
             let mode = if let Expr::Literal(Literal::Numeric(n)) = &value {
@@ -1185,6 +1213,18 @@ fn query_pragma(
                 program.emit_result_row(register, 1);
                 program.add_pragma_result_column(pragma.to_string());
             }
+            Ok(TransactionMode::None)
+        }
+        PragmaName::SqlDialect => {
+            let dialect = connection.get_sql_dialect();
+            let dialect_str = match dialect {
+                crate::SqlDialect::Sqlite => "sqlite",
+                crate::SqlDialect::Postgres => "postgres",
+            };
+            let register = program.alloc_register();
+            program.emit_string8(dialect_str.to_string(), register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::Synchronous => {

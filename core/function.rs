@@ -494,6 +494,21 @@ pub enum ScalarFunc {
     Attach,
     Detach,
     Unlikely,
+    PgGetUserById,
+    PgTableIsVisible,
+    PgFormatType,
+    PgGetExpr,
+    PgGetStatisticsObjDefColumns,
+    PgRelationIsPublishable,
+    PgGetConstraintDef,
+    PgGetIndexDef,
+    PgEncodingToChar,
+    PgGetFunctionResult,
+    PgGetFunctionArguments,
+    PgFunctionIsVisible,
+    PgTypeIsVisible,
+    Lpad,
+    Rpad,
     StatInit,
     StatPush,
     StatGet,
@@ -603,6 +618,21 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Attach => false, // changes database state
             ScalarFunc::Detach => false, // changes database state
             ScalarFunc::Unlikely => true,
+            ScalarFunc::PgGetUserById => true,
+            ScalarFunc::PgTableIsVisible => true,
+            ScalarFunc::PgFormatType => true,
+            ScalarFunc::PgGetExpr => true,
+            ScalarFunc::PgGetStatisticsObjDefColumns => true,
+            ScalarFunc::PgRelationIsPublishable => true,
+            ScalarFunc::PgGetConstraintDef => true,
+            ScalarFunc::PgGetIndexDef => true,
+            ScalarFunc::PgEncodingToChar => true,
+            ScalarFunc::PgGetFunctionResult => true,
+            ScalarFunc::PgGetFunctionArguments => true,
+            ScalarFunc::PgFunctionIsVisible => true,
+            ScalarFunc::PgTypeIsVisible => true,
+            ScalarFunc::Lpad => true,
+            ScalarFunc::Rpad => true,
             ScalarFunc::StatInit => false, // internal ANALYZE function
             ScalarFunc::StatPush => false, // internal ANALYZE function
             ScalarFunc::StatGet => false,  // internal ANALYZE function
@@ -732,6 +762,21 @@ impl Display for ScalarFunc {
             Self::Attach => "attach",
             Self::Detach => "detach",
             Self::Unlikely => "unlikely",
+            Self::PgGetUserById => "pg_get_userbyid",
+            Self::PgTableIsVisible => "pg_table_is_visible",
+            Self::PgFormatType => "format_type",
+            Self::PgGetExpr => "pg_get_expr",
+            Self::PgGetStatisticsObjDefColumns => "pg_get_statisticsobjdef_columns",
+            Self::PgRelationIsPublishable => "pg_relation_is_publishable",
+            Self::PgGetConstraintDef => "pg_get_constraintdef",
+            Self::PgGetIndexDef => "pg_get_indexdef",
+            Self::PgEncodingToChar => "pg_encoding_to_char",
+            Self::PgGetFunctionResult => "pg_get_function_result",
+            Self::PgGetFunctionArguments => "pg_get_function_arguments",
+            Self::PgFunctionIsVisible => "pg_function_is_visible",
+            Self::PgTypeIsVisible => "pg_type_is_visible",
+            Self::Lpad => "lpad",
+            Self::Rpad => "rpad",
             Self::StatInit => "stat_init",
             Self::StatPush => "stat_push",
             Self::StatGet => "stat_get",
@@ -866,6 +911,19 @@ impl ScalarFunc {
             | Self::BinRecordJsonObject
             | Self::ConnTxnId
             | Self::IsAutocommit => &[0],
+            // PostgreSQL catalog functions
+            Self::PgGetUserById
+            | Self::PgTableIsVisible
+            | Self::PgEncodingToChar
+            | Self::PgGetFunctionResult
+            | Self::PgGetFunctionArguments
+            | Self::PgFunctionIsVisible
+            | Self::PgTypeIsVisible
+            | Self::PgGetStatisticsObjDefColumns
+            | Self::PgRelationIsPublishable => &[1],
+            Self::PgFormatType | Self::PgGetConstraintDef | Self::PgGetIndexDef => &[1, 2],
+            Self::PgGetExpr => &[2, 3],
+            Self::Lpad | Self::Rpad => &[2, 3],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
             // Test functions for custom types (1-arg encode/decode, 2-arg operators)
@@ -1264,6 +1322,28 @@ impl Func {
             "if" | "iif" => Ok(Some(Self::Scalar(ScalarFunc::Iif))),
             "instr" => Ok(Some(Self::Scalar(ScalarFunc::Instr))),
             "like" => Ok(Some(Self::Scalar(ScalarFunc::Like))),
+            "pg_get_userbyid" => Ok(Some(Self::Scalar(ScalarFunc::PgGetUserById))),
+            "pg_table_is_visible" => Ok(Some(Self::Scalar(ScalarFunc::PgTableIsVisible))),
+            "format_type" => Ok(Some(Self::Scalar(ScalarFunc::PgFormatType))),
+            "pg_get_expr" => Ok(Some(Self::Scalar(ScalarFunc::PgGetExpr))),
+            "pg_get_statisticsobjdef_columns" => {
+                Ok(Some(Self::Scalar(ScalarFunc::PgGetStatisticsObjDefColumns)))
+            }
+            "pg_relation_is_publishable" => {
+                Ok(Some(Self::Scalar(ScalarFunc::PgRelationIsPublishable)))
+            }
+            "array_upper" => Ok(Some(Self::Scalar(ScalarFunc::ArrayLength))),
+            "pg_get_constraintdef" => Ok(Some(Self::Scalar(ScalarFunc::PgGetConstraintDef))),
+            "pg_get_indexdef" => Ok(Some(Self::Scalar(ScalarFunc::PgGetIndexDef))),
+            "pg_encoding_to_char" => Ok(Some(Self::Scalar(ScalarFunc::PgEncodingToChar))),
+            "pg_get_function_result" => Ok(Some(Self::Scalar(ScalarFunc::PgGetFunctionResult))),
+            "pg_get_function_arguments" => {
+                Ok(Some(Self::Scalar(ScalarFunc::PgGetFunctionArguments)))
+            }
+            "pg_function_is_visible" => Ok(Some(Self::Scalar(ScalarFunc::PgFunctionIsVisible))),
+            "pg_type_is_visible" => Ok(Some(Self::Scalar(ScalarFunc::PgTypeIsVisible))),
+            "lpad" => Ok(Some(Self::Scalar(ScalarFunc::Lpad))),
+            "rpad" => Ok(Some(Self::Scalar(ScalarFunc::Rpad))),
             "abs" => Ok(Some(Self::Scalar(ScalarFunc::Abs))),
             "upper" => Ok(Some(Self::Scalar(ScalarFunc::Upper))),
             "lower" => Ok(Some(Self::Scalar(ScalarFunc::Lower))),

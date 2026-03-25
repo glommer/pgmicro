@@ -2735,6 +2735,31 @@ pub fn translate_expr(
                                 func_ctx,
                             )
                         }
+                        // Generic fallback: validate arg count using arities(),
+                        // then translate args into registers and emit Insn::Function.
+                        _ => {
+                            let arities = srf.arities();
+                            // -1 means variadic — any count is valid
+                            if !arities.contains(&-1) {
+                                let n = args.len() as i32;
+                                if !arities.contains(&n) {
+                                    crate::bail_parse_error!(
+                                        "{} function called with {} arguments (expected {:?})",
+                                        srf,
+                                        n,
+                                        arities,
+                                    );
+                                }
+                            }
+                            translate_function(
+                                program,
+                                args,
+                                referenced_tables,
+                                resolver,
+                                target_register,
+                                func_ctx,
+                            )
+                        }
                     }
                 }
                 Func::Math(math_func) => match math_func.arity() {

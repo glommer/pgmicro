@@ -19,9 +19,9 @@ use crate::translate::{
 use crate::{
     ast::Limit,
     function::Func,
-    schema::Table,
+    schema::{Schema, Table},
     util::{exprs_are_equivalent, normalize_ident, validate_aggregate_function_tail},
-    Result,
+    Result, SqlDialect,
 };
 use crate::{
     function::{AggFunc, ExtFunc},
@@ -37,6 +37,28 @@ use turso_parser::ast::{
     self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, Select,
     TableInternalId, With,
 };
+
+/// Resolve a table name with dialect awareness.
+/// In SQLite mode, uses the standard schema lookup.
+/// In Postgres mode, hides SQLite-specific tables and falls back to pg catalog tables.
+fn resolve_table_for_dialect(
+    schema: &Schema,
+    name: &str,
+    dialect: SqlDialect,
+) -> Option<Arc<Table>> {
+    match dialect {
+        SqlDialect::Sqlite => schema.get_table(name),
+        SqlDialect::Postgres => {
+            if Schema::is_sqlite_specific_table(name) {
+                None
+            } else {
+                schema
+                    .get_table(name)
+                    .or_else(|| schema.get_postgres_table(name))
+            }
+        }
+    }
+}
 
 /// A CTE definition stored for deferred planning.
 /// Instead of planning CTEs once and cloning the result, we store the AST and
@@ -625,6 +647,17 @@ pub fn plan_ctes_as_outer_refs(
             crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
         }
 
+        // In Postgres mode, CTEs cannot shadow catalog tables
+        if connection.get_sql_dialect() == SqlDialect::Postgres
+            && resolve_table_for_dialect(resolver.schema(), &cte_name, connection.get_sql_dialect())
+                .is_some()
+        {
+            crate::bail_parse_error!(
+                "CTE name {} conflicts with catalog table name",
+                cte.tbl_name.as_str()
+            );
+        }
+
         // Clone the CTE select AST before planning, so we can store it for re-planning
         let cte_select_ast = cte.select.clone();
         // AS MATERIALIZED forces materialization
@@ -963,8 +996,11 @@ fn parse_table(
         return Ok(());
     }
 
-    // Resolve table using connection's with_schema method
-    let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+    // Resolve table using resolver's with_schema method with dialect awareness
+    let dialect = connection.get_sql_dialect();
+    let table = resolver.with_schema(database_id, |schema| {
+        resolve_table_for_dialect(schema, table_name.as_str(), dialect)
+    });
 
     if let Some(table) = table {
         let alias = maybe_alias
@@ -1267,6 +1303,21 @@ pub fn parse_from(
                 .any(|d| d.name == cte_name_normalized)
             {
                 crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
+            }
+
+            // In Postgres mode, CTEs cannot shadow catalog tables
+            if connection.get_sql_dialect() == SqlDialect::Postgres
+                && resolve_table_for_dialect(
+                    resolver.schema(),
+                    &cte_name_normalized,
+                    connection.get_sql_dialect(),
+                )
+                .is_some()
+            {
+                crate::bail_parse_error!(
+                    "CTE name {} conflicts with catalog table name",
+                    cte.tbl_name.as_str()
+                );
             }
             // Collect table names referenced in this CTE's FROM clause.
             let mut referenced_tables = Vec::new();

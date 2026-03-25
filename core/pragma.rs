@@ -85,6 +85,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["schema_version"],
         ),
+        SqlDialect => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["sql_dialect"],
+        ),
         Synchronous => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["synchronous"],
