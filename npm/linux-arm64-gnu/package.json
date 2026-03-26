@@ -1,6 +1,6 @@
 {
   "name": "pg-micro-linux-arm64-gnu",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "pgmicro native binaries for Linux arm64 (glibc)",
   "license": "MIT",
   "repository": {

@@ -1,6 +1,6 @@
 {
   "name": "pg-micro-darwin-arm64",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "pgmicro native binaries for macOS arm64",
   "license": "MIT",
   "repository": {

@@ -71,6 +71,49 @@ The key pieces:
 
 - **Dialect switching**: Turso supports dynamic dialect switching at the connection level. A single database can be accessed via both PostgreSQL and SQLite syntax — useful for tooling, migration, and interop.
 
+## Installation
+
+### CLI
+
+Run directly with npx (no install needed):
+
+```
+npx pg-micro
+```
+
+Or install globally:
+
+```
+npm install -g pg-micro
+pg-micro myapp.db
+```
+
+### JavaScript/TypeScript SDK
+
+```
+npm install pg-micro
+```
+
+```javascript
+import { connect } from "pg-micro";
+
+const db = await connect(":memory:");
+await db.exec("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT, email TEXT)");
+await db.exec("INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')");
+await db.exec("INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com')");
+
+const rows = await db.prepare("SELECT * FROM users").all();
+console.log(rows);
+// [
+//   { id: 1, name: 'Alice', email: 'alice@example.com' },
+//   { id: 2, name: 'Bob', email: 'bob@example.com' }
+// ]
+
+await db.close();
+```
+
+The SDK API is compatible with [`@tursodatabase/database`](https://www.npmjs.com/package/@tursodatabase/database).
+
 ## Examples
 
 ### In-memory database

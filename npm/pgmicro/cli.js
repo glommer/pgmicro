@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
+import { chmodSync } from "node:fs";
 import { join, dirname } from "node:path";
 
 const require = createRequire(import.meta.url);
@@ -31,6 +32,7 @@ try {
 }
 
 try {
+  chmodSync(binaryPath, 0o755);
   execFileSync(binaryPath, process.argv.slice(2), { stdio: "inherit" });
 } catch (e) {
   if (e.status != null) {
