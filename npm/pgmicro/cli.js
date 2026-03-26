@@ -6,10 +6,10 @@ import { join, dirname } from "node:path";
 const require = createRequire(import.meta.url);
 
 const platformPackages = {
-  "darwin-arm64": "pgmicro-darwin-arm64",
-  "darwin-x64": "pgmicro-darwin-arm64", // Rosetta 2
-  "linux-x64": "pgmicro-linux-x64-gnu",
-  "linux-arm64": "pgmicro-linux-arm64-gnu",
+  "darwin-arm64": "pg-micro-darwin-arm64",
+  "darwin-x64": "pg-micro-darwin-arm64", // Rosetta 2
+  "linux-x64": "pg-micro-linux-x64-gnu",
+  "linux-arm64": "pg-micro-linux-arm64-gnu",
 };
 
 const key = `${process.platform}-${process.arch}`;

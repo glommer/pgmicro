@@ -3,9 +3,9 @@ name: Rust Benchmarks+Nyrkiö
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "master", "notmain"]
+    branches: ["main", "notmain"]
   pull_request:
-    branches: ["main", "notmain", "master"]
+    branches: ["main", "notmain"]
 
 env:
   CARGO_TERM_COLOR: never

@@ -67,6 +67,6 @@ jobs:
           restore-keys: test-pg-
           save-always: true
       - name: Postgres integration tests
-        run: cargo test --locked -p turso_tests integration::postgres
+        run: cargo test --locked -p core_tester integration::postgres
       - name: pgmicro CLI tests
         run: cargo test --locked -p pgmicro

@@ -37,16 +37,15 @@ cd "$REPO_ROOT/bindings/javascript"
 npx napi build \
   --platform \
   --features default-postgres \
-  --esm \
   --manifest-path "$REPO_ROOT/bindings/javascript/Cargo.toml" \
   --output-dir "$SCRIPT_DIR/pgmicro" \
   --target "$NAPI_TARGET"
 
-# napi build produces turso.<platform>.node — rename to pgmicro.<platform>.node
-TURSO_NODE=$(ls "$SCRIPT_DIR/pgmicro"/turso.*.node 2>/dev/null | head -1)
-if [ -n "$TURSO_NODE" ]; then
-  BASENAME=$(basename "$TURSO_NODE" | sed 's/^turso\./pgmicro./')
-  mv "$TURSO_NODE" "$SCRIPT_DIR/pgmicro/$BASENAME"
+# napi build produces index.<platform>.node — rename to pgmicro.<platform>.node
+INDEX_NODE=$(ls "$SCRIPT_DIR/pgmicro"/index.*.node 2>/dev/null | head -1)
+if [ -n "$INDEX_NODE" ]; then
+  BASENAME=$(basename "$INDEX_NODE" | sed 's/^index\./pgmicro./')
+  mv "$INDEX_NODE" "$SCRIPT_DIR/pgmicro/$BASENAME"
   NODE_FILE="$BASENAME"
 fi
 

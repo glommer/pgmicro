@@ -1,11 +1,11 @@
 {
-  "name": "pgmicro-linux-x64-gnu",
+  "name": "pg-micro-linux-x64-gnu",
   "version": "0.0.1",
   "description": "pgmicro native binaries for Linux x64 (glibc)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tursodatabase/turso"
+    "url": "https://github.com/glommer/pgmicro"
   },
   "os": ["linux"],
   "cpu": ["x64"],
