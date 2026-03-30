@@ -1360,7 +1360,7 @@ impl Func {
             "substring" => Ok(Some(Self::Scalar(ScalarFunc::Substring))),
             "date" => Ok(Some(Self::Scalar(ScalarFunc::Date))),
             "time" => Ok(Some(Self::Scalar(ScalarFunc::Time))),
-            "datetime" => Ok(Some(Self::Scalar(ScalarFunc::DateTime))),
+            "datetime" | "now" => Ok(Some(Self::Scalar(ScalarFunc::DateTime))),
             "typeof" => Ok(Some(Self::Scalar(ScalarFunc::Typeof))),
             "last_insert_rowid" => Ok(Some(Self::Scalar(ScalarFunc::LastInsertRowid))),
             "unicode" => Ok(Some(Self::Scalar(ScalarFunc::Unicode))),
