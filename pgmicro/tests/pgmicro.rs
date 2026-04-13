@@ -217,3 +217,77 @@ fn empty_input_returns_zero() {
     let output = run_pgmicro(b"");
     assert_eq!(output.status.code(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// DEFAULT functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_now_produces_value() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, ts TEXT DEFAULT now());\n\
+          INSERT INTO t(id) VALUES (1);\n\
+          SELECT ts FROM t;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // now() produces a timestamp like "2026-04-13 ..."
+    assert!(
+        out.contains("20"),
+        "expected timestamp from now(), got: {out}"
+    );
+}
+
+#[test]
+fn default_gen_random_uuid_produces_value() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, uid TEXT DEFAULT gen_random_uuid());\n\
+          INSERT INTO t(id) VALUES (1);\n\
+          INSERT INTO t(id) VALUES (2);\n\
+          SELECT uid FROM t ORDER BY id;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // UUID contains hyphens
+    assert!(
+        out.matches('-').count() >= 4,
+        "expected UUID with hyphens, got: {out}"
+    );
+}
+
+#[test]
+fn describe_table_shows_default_expressions() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, ts TEXT DEFAULT now(), uid TEXT DEFAULT gen_random_uuid());\n\
+          \\d t\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("now"),
+        "\\d should show now() default, got: {out}"
+    );
+    assert!(
+        out.contains("gen_random_uuid"),
+        "\\d should show gen_random_uuid() default, got: {out}"
+    );
+}
+
+#[test]
+fn default_casted_expression() {
+    let output = run_pgmicro(
+        b"CREATE TABLE config(id INT, data jsonb DEFAULT '{}'::jsonb, tags jsonb DEFAULT '[]'::jsonb);\n\
+          INSERT INTO config(id) VALUES (1);\n\
+          SELECT data, tags FROM config;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("{}"),
+        "expected '{{}}' from casted default, got: {out}"
+    );
+    assert!(
+        out.contains("[]"),
+        "expected '[]' from casted default, got: {out}"
+    );
+}

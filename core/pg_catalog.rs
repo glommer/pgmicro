@@ -4,7 +4,7 @@ use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 #[allow(unused_imports)]
 use crate::Numeric;
-use crate::{Connection, LimboError, Value};
+use crate::{Connection, LimboError, SqlDialect, Value};
 use rustc_hash::FxHashMap as HashMap;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
@@ -2784,13 +2784,14 @@ impl PgGetTableDefCursor {
     }
 
     fn load_table_defs(&mut self) -> Result<(), LimboError> {
-        // Get schema with read lock
+        // Query sqlite_master for all table SQL, keyed by name
+        let sql_map = self.load_sqlite_master_sql()?;
+
         let schema = self.conn.schema.read().clone();
         self.rows.clear();
 
-        // Get DDL from sqlite_master for each user table
         for (table_name, table) in &schema.tables {
-            // Skip system tables (sqlite_master, sqlite_schema, etc.)
+            // Skip system tables
             if table_name.starts_with("sqlite_")
                 || table_name == "sqlite_master"
                 || table_name == "sqlite_schema"
@@ -2799,16 +2800,23 @@ impl PgGetTableDefCursor {
             }
 
             // Skip virtual tables and subqueries
-            if !matches!(table.as_ref(), Table::BTree(_)) {
+            let Table::BTree(btree_table) = table.as_ref() else {
                 continue;
-            }
+            };
 
-            // Get the original SQLite DDL and convert to PostgreSQL
-            let sqlite_ddl = self.get_sqlite_ddl(table_name)?;
-            let postgres_ddl = self.convert_to_postgres_ddl(&sqlite_ddl);
+            let postgres_ddl = match sql_map.get(table_name) {
+                Some(schema_sql) => {
+                    let (dialect, raw_sql) = SqlDialect::from_schema_sql(schema_sql)?;
+                    match dialect {
+                        SqlDialect::Postgres => raw_sql.to_string(),
+                        SqlDialect::Sqlite => self.convert_to_postgres_ddl(raw_sql),
+                    }
+                }
+                None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
+            };
 
             self.rows.push(vec![
-                Value::Text("public".into()), // schema_name (PostgreSQL default)
+                Value::Text("public".into()),
                 Value::Text(table_name.clone().into()),
                 Value::Text(postgres_ddl.into()),
             ]);
@@ -2817,50 +2825,21 @@ impl PgGetTableDefCursor {
         Ok(())
     }
 
-    fn get_sqlite_ddl(&self, table_name: &str) -> Result<String, LimboError> {
-        // Get the DDL from the schema's sqlite_master info
-        // For now, we'll reconstruct it from the table definition
-        // In a full implementation, we'd query sqlite_master directly
-        let schema = self.conn.schema.read();
-
-        if let Some(table) = schema.tables.get(table_name) {
-            if let Table::BTree(btree_table) = table.as_ref() {
-                let mut ddl = format!("CREATE TABLE {table_name} (");
-                let cols: Vec<String> = btree_table
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        let col_name = col.name.as_deref().unwrap_or("unnamed");
-                        let ty_str = &col.ty_str;
-                        let mut col_def = format!("{col_name} {ty_str}");
-
-                        // Check if this column is a primary key
-                        for (pk_col, _) in &btree_table.primary_key_columns {
-                            if pk_col == col_name {
-                                col_def.push_str(" PRIMARY KEY");
-                                break;
-                            }
-                        }
-
-                        // Add NOT NULL if column is not nullable
-                        if col.notnull() {
-                            col_def.push_str(" NOT NULL");
-                        }
-
-                        // Add default value if present
-                        if col.default.is_some() {
-                            col_def.push_str(" DEFAULT ..."); // Simplified for now
-                        }
-
-                        col_def
-                    })
-                    .collect();
-                ddl.push_str(&cols.join(", "));
-                ddl.push(')');
-                return Ok(ddl);
+    /// Read all table SQL strings from sqlite_master into a map.
+    fn load_sqlite_master_sql(&self) -> Result<HashMap<String, String>, LimboError> {
+        let mut map = HashMap::default();
+        let mut stmt = self.conn.prepare_internal(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'table'",
+        )?;
+        let rows = stmt.run_collect_rows()?;
+        for row in rows {
+            if let (Some(Value::Text(name)), Some(Value::Text(sql))) =
+                (row.first(), row.get(1))
+            {
+                map.insert(name.as_str().to_string(), sql.as_str().to_string());
             }
         }
-        Ok(format!("CREATE TABLE {table_name} (...)"))
+        Ok(map)
     }
 
     fn convert_to_postgres_ddl(&self, sqlite_ddl: &str) -> String {

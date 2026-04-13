@@ -287,6 +287,41 @@ pub enum SqlDialect {
     Postgres = 1,
 }
 
+const DIALECT_PREFIX: &str = "/* turso_dialect:";
+const DIALECT_SUFFIX: &str = " */ ";
+
+impl SqlDialect {
+    /// Return the dialect handler for parsing and formatting schema SQL.
+    pub fn handler(&self) -> &'static dyn DialectHandler {
+        match self {
+            SqlDialect::Sqlite => &SqliteHandler,
+            SqlDialect::Postgres => &PgHandler,
+        }
+    }
+
+    /// Extract dialect and raw SQL from a possibly-prefixed sqlite_master string.
+    /// Returns `(SqlDialect::Sqlite, sql)` when no prefix is present.
+    pub fn from_schema_sql(sql: &str) -> Result<(SqlDialect, &str)> {
+        let Some(rest) = sql.strip_prefix(DIALECT_PREFIX) else {
+            return Ok((SqlDialect::Sqlite, sql));
+        };
+        let Some((name, raw_sql)) = rest.split_once(DIALECT_SUFFIX) else {
+            return Err(LimboError::ParseError(
+                "malformed turso_dialect prefix".to_string(),
+            ));
+        };
+        let dialect = match name {
+            "pg" => SqlDialect::Postgres,
+            other => {
+                return Err(LimboError::ParseError(format!(
+                    "unknown SQL dialect: {other}"
+                )));
+            }
+        };
+        Ok((dialect, raw_sql))
+    }
+}
+
 impl Default for SqlDialect {
     fn default() -> Self {
         if cfg!(feature = "default-postgres") {
@@ -294,6 +329,65 @@ impl Default for SqlDialect {
         } else {
             SqlDialect::Sqlite
         }
+    }
+}
+
+/// Dialect-specific schema operations. Each dialect knows how to parse its
+/// own CREATE TABLE SQL and how to format SQL for storage in sqlite_master.
+pub trait DialectHandler {
+    /// Parse a CREATE TABLE statement into a BTreeTable.
+    fn parse_create_table(&self, sql: &str, root_page: i64) -> Result<schema::BTreeTable>;
+
+    /// Format the SQL string that will be stored in sqlite_master.
+    /// `input` is the original user-provided SQL; `tbl_name` and `body` are
+    /// the parsed AST (used by SQLite to reconstruct a canonical form).
+    fn format_schema_sql(
+        &self,
+        input: &str,
+        tbl_name: &turso_parser::ast::QualifiedName,
+        body: &turso_parser::ast::CreateTableBody,
+    ) -> Result<String>;
+}
+
+struct SqliteHandler;
+
+impl DialectHandler for SqliteHandler {
+    fn parse_create_table(&self, sql: &str, root_page: i64) -> Result<schema::BTreeTable> {
+        schema::BTreeTable::from_sql(sql, root_page)
+    }
+
+    fn format_schema_sql(
+        &self,
+        _input: &str,
+        tbl_name: &turso_parser::ast::QualifiedName,
+        body: &turso_parser::ast::CreateTableBody,
+    ) -> Result<String> {
+        let mut sql = String::new();
+        sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body).as_str());
+        match body {
+            turso_parser::ast::CreateTableBody::ColumnsAndConstraints { .. } => {}
+            turso_parser::ast::CreateTableBody::AsSelect(_) => {
+                bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+            }
+        }
+        Ok(sql)
+    }
+}
+
+struct PgHandler;
+
+impl DialectHandler for PgHandler {
+    fn parse_create_table(&self, sql: &str, root_page: i64) -> Result<schema::BTreeTable> {
+        schema::BTreeTable::from_pg_sql(sql, root_page)
+    }
+
+    fn format_schema_sql(
+        &self,
+        input: &str,
+        _tbl_name: &turso_parser::ast::QualifiedName,
+        _body: &turso_parser::ast::CreateTableBody,
+    ) -> Result<String> {
+        Ok(format!("{DIALECT_PREFIX}pg{DIALECT_SUFFIX}{input}"))
     }
 }
 

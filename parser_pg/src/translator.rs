@@ -640,13 +640,16 @@ impl PostgreSQLTranslator {
                     conflict_clause: None,
                 }),
                 ConstrType::ConstrUnique => Some(ast::ColumnConstraint::Unique(None)),
-                ConstrType::ConstrDefault => constraint.raw_expr.as_ref().and_then(|raw_expr| {
-                    deparse_default_expr(raw_expr).map(|sql| {
-                        ast::ColumnConstraint::Default(Box::new(ast::Expr::Literal(
-                            ast::Literal::String(format!("'{sql}'")),
-                        )))
-                    })
-                }),
+                ConstrType::ConstrDefault => {
+                    match constraint.raw_expr.as_ref() {
+                        Some(raw_expr) => {
+                            Some(ast::ColumnConstraint::Default(Box::new(
+                                self.translate_expr(raw_expr)?,
+                            )))
+                        }
+                        None => None,
+                    }
+                }
                 _ => None,
             };
             if let Some(c) = constraint_ast {
@@ -2487,21 +2490,9 @@ impl PostgreSQLTranslator {
 
         // Map PG function names to SQLite equivalents
         let mapped_name = match func_name.to_lowercase().as_str() {
-            "now" | "pg_catalog.now" | "transaction_timestamp" | "statement_timestamp" => {
-                // now() → strftime('%Y-%m-%d %H:%M:%f', 'now')
-                return Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string("strftime"),
-                    distinctness,
-                    args: vec![
-                        Box::new(ast::Expr::Literal(ast::Literal::String(
-                            "'%Y-%m-%d %H:%M:%f'".into(),
-                        ))),
-                        Box::new(ast::Expr::Literal(ast::Literal::String("'now'".into()))),
-                    ],
-                    order_by: vec![],
-                    filter_over,
-                });
-            }
+            "pg_catalog.now" => "now".to_string(),
+            "pg_catalog.transaction_timestamp" => "transaction_timestamp".to_string(),
+            "pg_catalog.statement_timestamp" => "statement_timestamp".to_string(),
             "concat" => {
                 // concat(a, b, c) → a || b || c
                 if args.len() >= 2 {
@@ -2566,7 +2557,6 @@ impl PostgreSQLTranslator {
                 // Map to abs(random()) / 9223372036854775807.0 for compatibility
                 func_name
             }
-            "gen_random_uuid" => "uuid4".to_string(),
             _ => func_name,
         };
 
@@ -3703,24 +3693,17 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
                 })
                 .collect();
             let func_name = name.join(".");
-            // Map PG functions to SQLite equivalents for DEFAULT expressions
-            match func_name.to_lowercase().as_str() {
-                "now" | "pg_catalog.now" | "current_timestamp" => {
-                    // Use strftime with millisecond precision for proper timestamp
-                    // formatting (CURRENT_TIMESTAMP only has second precision)
-                    Some("strftime('%Y-%m-%d %H:%M:%f', 'now')".to_string())
-                }
-                "current_date" => Some("CURRENT_DATE".to_string()),
-                "current_time" => Some("CURRENT_TIME".to_string()),
-                _ => {
-                    let args: Vec<String> = func_call
-                        .args
-                        .iter()
-                        .filter_map(deparse_default_expr)
-                        .collect();
-                    Some(format!("{func_name}({args})", args = args.join(", ")))
-                }
-            }
+            // Strip pg_catalog schema prefix — functions are registered
+            // without it.
+            let func_name = func_name
+                .strip_prefix("pg_catalog.")
+                .unwrap_or(&func_name);
+            let args: Vec<String> = func_call
+                .args
+                .iter()
+                .filter_map(deparse_default_expr)
+                .collect();
+            Some(format!("{func_name}({args})", args = args.join(", ")))
         }
         Some(Node::SqlvalueFunction(svf)) => {
             use pg_query::protobuf::SqlValueFunctionOp;
@@ -5312,7 +5295,7 @@ mod tests {
     }
 
     #[test]
-    fn test_function_mapping_now() {
+    fn test_function_passthrough_now() {
         let translator = PostgreSQLTranslator::new();
         let sql = "SELECT now()";
         let parsed = crate::parse(sql).unwrap();
@@ -5322,7 +5305,11 @@ mod tests {
             if let ast::OneSelect::Select { columns, .. } = &select.body.select {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::FunctionCall { name, .. } = &**expr {
-                        assert_eq!(name.as_str(), "strftime", "now() should map to strftime");
+                        assert_eq!(
+                            name.as_str(),
+                            "now",
+                            "now() should pass through as registered scalar"
+                        );
                     } else {
                         panic!("Expected FunctionCall");
                     }
@@ -5350,7 +5337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_function_mapping_gen_random_uuid() {
+    fn test_function_passthrough_gen_random_uuid() {
         let translator = PostgreSQLTranslator::new();
         let sql = "SELECT gen_random_uuid()";
         let parsed = crate::parse(sql).unwrap();
@@ -5360,7 +5347,9 @@ mod tests {
             if let ast::OneSelect::Select { columns, .. } = &select.body.select {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::FunctionCall { name, .. } = &**expr {
-                        assert_eq!(name.as_str(), "uuid4");
+                        // gen_random_uuid is registered as a scalar function,
+                        // not remapped at the AST level.
+                        assert_eq!(name.as_str(), "gen_random_uuid");
                     }
                 }
             }

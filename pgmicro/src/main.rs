@@ -215,10 +215,11 @@ fn cmd_list_tables(conn: &Arc<Connection>, w: &mut dyn Write) {
 fn cmd_describe_table(conn: &Arc<Connection>, table_name: &str, w: &mut dyn Write) {
     let safe_name = table_name.replace('\'', "''");
     let sql = format!(
-        "SELECT a.attname, t.typname, a.attnotnull, a.atthasdef, a.attnum \
+        "SELECT a.attname, t.typname, a.attnotnull, COALESCE(d.adbin, ''), a.attnum \
          FROM pg_attribute a \
          JOIN pg_class c ON a.attrelid = c.oid \
          JOIN pg_type t ON a.atttypid = t.oid \
+         LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
          WHERE c.relname = '{safe_name}' AND a.attnum > 0 AND a.attisdropped = 0 \
          ORDER BY a.attnum"
     );
@@ -239,8 +240,7 @@ fn cmd_describe_table(conn: &Arc<Connection>, table_name: &str, w: &mut dyn Writ
                 let col_type = row.get_value(1).to_string();
                 let notnull = row.get_value(2).to_string();
                 let nullable = if notnull == "1" { "NOT NULL" } else { "NULL" };
-                let hasdef = row.get_value(3).to_string();
-                let default_str = if hasdef == "1" { "YES" } else { "" };
+                let default_str = row.get_value(3).to_string();
                 table.add_row(vec![
                     Cell::new(&col_name),
                     Cell::new(&col_type),

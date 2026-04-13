@@ -14,6 +14,7 @@ use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
+use crate::SqlDialect;
 use crate::{turso_assert, turso_debug_assert};
 use turso_macros::AtomicEnum;
 
@@ -1360,7 +1361,8 @@ impl Schema {
                     };
                     self.add_virtual_table(vtab)?;
                 } else {
-                    let table = BTreeTable::from_sql(sql, root_page)?;
+                    let (dialect, raw_sql) = SqlDialect::from_schema_sql(sql)?;
+                    let table = dialect.handler().parse_create_table(raw_sql, root_page)?;
 
                     if table.has_virtual_columns && !self.generated_columns_enabled {
                         return Err(LimboError::ParseError(format!(
@@ -2349,6 +2351,28 @@ impl BTreeTable {
                 create_table(tbl_name.name.as_str(), &body, root_page)
             }
             _ => unreachable!("Expected CREATE TABLE statement"),
+        }
+    }
+
+    /// Parse a PostgreSQL CREATE TABLE statement and build a BTreeTable.
+    /// Used during schema reload when `sqlite_master.sql` carries the
+    /// `/* turso_dialect:pg */` prefix.
+    pub fn from_pg_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
+        use turso_parser_pg::translator::PostgreSQLTranslator;
+
+        let parse_result =
+            turso_parser_pg::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let translator = PostgreSQLTranslator::new();
+        let stmt = translator
+            .translate(&parse_result)
+            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        match stmt {
+            Stmt::CreateTable { tbl_name, body, .. } => {
+                create_table(tbl_name.name.as_str(), &body, root_page)
+            }
+            _ => Err(LimboError::ParseError(
+                "expected CREATE TABLE statement".to_string(),
+            )),
         }
     }
 

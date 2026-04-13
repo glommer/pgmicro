@@ -200,6 +200,7 @@ pub fn translate_inner(
             body,
             program,
             connection,
+            input,
         )?,
         ast::Stmt::CreateTrigger {
             temporary,
