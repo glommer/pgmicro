@@ -4,11 +4,9 @@ name: Build & Publish Go Driver
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
-    tags:
-      - "v*"
+    branches: ["turso-only"]
   pull_request:
-    branches: ["main"]
+    branches: ["turso-only"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

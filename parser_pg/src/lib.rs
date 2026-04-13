@@ -5,7 +5,7 @@ pub mod translator;
 
 #[derive(Debug, Error)]
 pub enum ParseError {
-    #[error("Parse error: {0}")]
+    #[error("{0}")]
     ParseError(String),
 }
 

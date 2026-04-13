@@ -4,12 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
-    tags:
-      - v*
+      - turso-only
   pull_request:
     branches:
-      - main
+      - turso-only
 
 env:
   DEBUG: napi:*

@@ -12,7 +12,7 @@ pub fn to_u16(v: usize) -> u16 {
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    schema::{BTreeTable, CheckConstraint, Column, Index},
+    schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
@@ -730,7 +730,10 @@ pub enum Insn {
     /// subprogram, so subprograms can be reentrant and recursive. The Param opcode
     /// is used by subprograms to access content in registers of the calling bytecode program."
     Program {
-        params: Vec<Value>,
+        /// Parent register indices for each parameter the subprogram reads.
+        /// At runtime, values are copied from these parent registers into
+        /// the child statement's parameters via bind_at.
+        param_registers: Vec<usize>,
         program: Arc<PreparedProgram>,
         /// Jump target when RAISE(IGNORE) fires in the subprogram.
         /// Points to the "skip this row" address in the parent program.
@@ -929,8 +932,12 @@ pub enum Insn {
     SorterOpen {
         cursor_id: CursorID, // P1
         columns: usize,      // P2
-        /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
-        order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
+        /// Combined order, collation, and nulls ordering per column.
+        order_collations_nulls: Vec<(
+            SortOrder,
+            Option<CollationSeq>,
+            Option<turso_parser::ast::NullsOrder>,
+        )>,
         /// Per-column custom type comparators for ORDER BY sorting.
         /// When present, the comparator is used instead of standard value comparison.
         comparators: Vec<Option<SortComparatorType>>,
@@ -1454,6 +1461,7 @@ pub enum Insn {
         table: String,
         column: Box<Column>,
         check_constraints: Vec<CheckConstraint>,
+        foreign_keys: Vec<Arc<ForeignKey>>,
     },
     AlterColumn {
         db: usize,
@@ -1662,6 +1670,8 @@ pub enum Insn {
     /// VACUUM INTO - create a compacted copy of the database at the specified path.
     /// This copies all schema and data from the current database to a new file.
     VacuumInto {
+        /// Database name to vacuum
+        schema_name: String,
         /// Destination file path for the vacuumed database
         dest_path: String,
     },
@@ -1914,6 +1924,49 @@ impl Insn {
         // dont use this because its still using match
         // InsnVariants::from(self).to_function_fast()
         INSN_VTABLE[self.discriminant() as usize]
+    }
+
+    /// Returns true if this opcode cannot directly modify persistent database
+    /// contents. This is used to compute PreparedProgram::readonly, mirroring
+    /// SQLite's sqlite3_stmt_readonly() classification over compiled bytecode.
+    pub fn is_readonly(&self) -> bool {
+        match self {
+            Self::Checkpoint { .. }
+            | Self::VCreate { .. }
+            | Self::VUpdate { .. }
+            | Self::VDestroy { .. }
+            | Self::VRename { .. }
+            | Self::Transaction {
+                tx_mode: TransactionMode::Write | TransactionMode::Concurrent,
+                ..
+            }
+            | Self::Insert { .. }
+            | Self::Delete { .. }
+            | Self::IdxDelete { .. }
+            | Self::OpenWrite { .. }
+            | Self::CreateBtree { .. }
+            | Self::IndexMethodCreate { .. }
+            | Self::IndexMethodDestroy { .. }
+            | Self::IndexMethodOptimize { .. }
+            | Self::Destroy { .. }
+            | Self::DropTable { .. }
+            | Self::DropView { .. }
+            | Self::DropIndex { .. }
+            | Self::DropTrigger { .. }
+            | Self::DropType { .. }
+            | Self::AddType { .. }
+            | Self::ParseSchema { .. }
+            | Self::PopulateMaterializedViews { .. }
+            | Self::SetCookie { .. }
+            | Self::RenameTable { .. }
+            | Self::DropColumn { .. }
+            | Self::AddColumn { .. }
+            | Self::AlterColumn { .. }
+            | Self::JournalMode { .. } => false,
+            Self::MaxPgcnt { new_max, .. } => *new_max == 0,
+            Self::Program { program, .. } => program.is_readonly(),
+            _ => true,
+        }
     }
 }
 

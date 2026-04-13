@@ -4,12 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
-    paths:
-      - "bindings/java/**"
-      - "scripts/corruption-debug-tools/**"
-      - "testing/sqlancer/**"
-      - ".github/workflows/build-sqlancer.yml"
+      - turso-only
 
 # Add permissions needed for OIDC authentication with AWS
 permissions:

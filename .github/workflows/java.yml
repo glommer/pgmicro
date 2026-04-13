@@ -1,14 +1,13 @@
 name: Java Tests
 
 on:
+  workflow_dispatch:
   push:
     branches:
-      - main
-    tags:
-      - v*
+      - turso-only
   pull_request:
     branches:
-      - main
+      - turso-only
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}

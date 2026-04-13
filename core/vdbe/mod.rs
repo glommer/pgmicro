@@ -68,7 +68,8 @@ use crate::{
     vdbe::{builder::CursorType, insn::Insn},
 };
 use crate::{
-    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, SyncMode, TransactionState,
+    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, Statement, SyncMode,
+    TransactionState,
 };
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
@@ -78,6 +79,7 @@ use execute::{
 };
 use turso_parser::ast::ResolveType;
 
+use crate::io::TempFile;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
@@ -437,6 +439,9 @@ pub struct ProgramState {
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<[u32; 4]>,
     pub execution_state: ProgramExecutionState,
+    /// Per-execution statement deadline derived from the connection query timeout.
+    /// `None` means no timeout.
+    pub query_deadline: Option<crate::MonotonicInstant>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     #[cfg(feature = "json")]
@@ -445,7 +450,7 @@ pub struct ProgramState {
     op_destroy_state: OpDestroyState,
     op_idx_delete_state: Option<OpIdxDeleteState>,
     op_integrity_check_state: OpIntegrityCheckState,
-    /// Metrics collected during statement execution
+    /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
     op_open_ephemeral_state: OpOpenEphemeralState,
     op_program_state: OpProgramState,
@@ -483,6 +488,9 @@ pub struct ProgramState {
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
+    /// TempFile handles for ephemeral cursors, keyed by cursor_id.
+    /// Dropping removes the temp file from disk.
+    ephemeral_temp_files: HashMap<usize, TempFile>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
@@ -503,6 +511,10 @@ pub struct ProgramState {
     /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
+    pub(crate) op_parse_schema_state: execute::OpParseSchemaState,
+    /// Cached subprogram Statements keyed by the PC of the Program instruction.
+    /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
+    pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
 }
 
 impl std::fmt::Debug for Program {
@@ -537,6 +549,7 @@ impl ProgramState {
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
+            query_deadline: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
@@ -576,6 +589,7 @@ impl ProgramState {
             rowsets: HashMap::default(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
+            ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
@@ -584,6 +598,8 @@ impl ProgramState {
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_cdc_info: None,
+            op_parse_schema_state: None,
+            subprogram_stmt_cache: HashMap::default(),
         }
     }
 
@@ -605,6 +621,10 @@ impl ProgramState {
 
     pub fn interrupt(&mut self) {
         self.execution_state = ProgramExecutionState::Interrupting;
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        matches!(self.execution_state, ProgramExecutionState::Interrupting)
     }
 
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
@@ -668,6 +688,7 @@ impl ProgramState {
         self.ended_coroutine.clear();
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
+        self.query_deadline = None;
         self.current_collation = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
@@ -679,7 +700,6 @@ impl ProgramState {
         };
         self.op_idx_delete_state = None;
         self.op_integrity_check_state = OpIntegrityCheckState::Start;
-        self.metrics = StatementMetrics::new();
         self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         self.op_new_rowid_state = OpNewRowidState::Start;
         self.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
@@ -708,6 +728,7 @@ impl ProgramState {
         self.rowsets.clear();
         self.bloom_filters.clear();
         self.hash_tables.clear();
+        self.ephemeral_temp_files.clear();
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
         self.uses_subjournal = false;
@@ -719,6 +740,57 @@ impl ProgramState {
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
         self.pending_cdc_info = None;
+        self.subprogram_stmt_cache.clear();
+    }
+
+    #[inline]
+    pub fn record_rows_read(&mut self, count: u64) {
+        self.metrics.rows_read = self.metrics.rows_read.saturating_add(count);
+    }
+
+    #[inline]
+    pub fn record_rows_written(&mut self, count: u64) {
+        self.metrics.rows_written = self.metrics.rows_written.saturating_add(count);
+    }
+
+    pub(crate) fn metrics(&self) -> StatementMetrics {
+        let mut metrics = self.metrics.clone();
+        if let OpProgramState::Step { statement, .. } = &self.op_program_state {
+            metrics.merge(&statement.metrics());
+        }
+        for statement in self.subprogram_stmt_cache.values() {
+            metrics.merge(&statement.metrics());
+        }
+        metrics
+    }
+
+    pub(crate) fn reset_metrics(&mut self) {
+        self.metrics.reset();
+        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+            statement.reset_metrics();
+        }
+        for statement in self.subprogram_stmt_cache.values_mut() {
+            statement.reset_metrics();
+        }
+    }
+
+    pub(crate) fn reset_stmt_status(&mut self, counter: crate::statement::StatementStatusCounter) {
+        match counter {
+            crate::statement::StatementStatusCounter::FullscanStep => {
+                self.metrics.fullscan_steps = 0
+            }
+            crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
+            crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
+            crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
+            crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
+            crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
+        }
+        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+            statement.reset_stmt_status(counter);
+        }
+        for statement in self.subprogram_stmt_cache.values_mut() {
+            statement.reset_stmt_status(counter);
+        }
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -1010,6 +1082,9 @@ pub struct PreparedProgram {
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
+    /// Flag that detect if the sqlite statement will directly manipulate the database file.\
+    /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
+    pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
     pub sql: String,
@@ -1086,9 +1161,15 @@ impl PreparedProgram {
     pub fn is_compatible_with(&self, connection: &Connection) -> bool {
         self.prepare_context.matches_connection(connection)
     }
+
+    #[inline]
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
+    }
 }
 
 impl Program {
+    #[inline]
     pub fn prepared(&self) -> &Arc<PreparedProgram> {
         &self.prepared
     }
@@ -1099,11 +1180,34 @@ impl Program {
             connection,
         }
     }
+
+    #[inline]
+    pub fn is_readonly(&self) -> bool {
+        self.prepared().is_readonly()
+    }
 }
 
 impl Program {
     fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
         self.connection.get_pager_from_database_index(idx)
+    }
+
+    #[inline]
+    fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I) -> bool
+    where
+        I: crate::IO + ?Sized,
+    {
+        let connection_interrupt = self.connection.is_interrupted();
+        let hit_query_deadline = state
+            .query_deadline
+            .is_some_and(|deadline| io.current_time_monotonic() >= deadline);
+        let progress_interrupt = self
+            .connection
+            .should_interrupt_for_progress(state.metrics.vm_steps);
+        if connection_interrupt || hit_query_deadline || progress_interrupt {
+            state.interrupt();
+        }
+        state.is_interrupted()
     }
 
     pub fn step(
@@ -1144,7 +1248,7 @@ impl Program {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
-        if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
+        if self.maybe_request_interrupt(state, pager.io.as_ref()) {
             return Ok(StepResult::Interrupt);
         }
 
@@ -1245,7 +1349,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
 
-            if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
+            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
                 return Ok(StepResult::Interrupt);
             }
 
@@ -1292,7 +1396,7 @@ impl Program {
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
-            if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
+            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
                 self.abort(pager, None, state)?;
                 return Ok(StepResult::Interrupt);
             }
@@ -1904,7 +2008,11 @@ impl Program {
 
         let mut abort_error: Option<LimboError> = None;
 
-        if self.is_trigger_subprogram() {
+        // Only end trigger execution if the subprogram was actually running.
+        // Cached (pooled) statements may be dropped after their trigger execution
+        // was already ended by op_program; calling end again would pop the wrong
+        // entry from the executing_triggers stack.
+        if self.is_trigger_subprogram() && state.execution_state.is_running() {
             self.connection.end_trigger_execution();
         }
         // Errors from nested statements are handled by the parent statement.

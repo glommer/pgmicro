@@ -1,11 +1,18 @@
-# Turso compatibility with SQLite
+# Turso SQLite Compatibility
 
-This document describes the compatibility of Turso with SQLite.
+Turso is a re-implementation of SQLite in Rust. This document describes the
+current state of compatibility between the two. Any deviation from SQLite
+behavior that is not explicitly documented as an opt-in extension is
+considered a bug.
+
+Compatibility is validated through differential testing against SQLite and
+ongoing work to pass the full SQLite TCL test suite.
 
 ## Table of contents
 
-- [Turso compatibility with SQLite](#turso-compatibility-with-sqlite)
+- [Turso SQLite Compatibility](#turso-sqlite-compatibility)
   - [Table of contents](#table-of-contents)
+  - [Guarantees](#guarantees)
   - [Overview](#overview)
     - [Features](#features)
     - [Limitations](#limitations)
@@ -54,9 +61,14 @@ This document describes the compatibility of Turso with SQLite.
     - [Table-Valued Functions](#table-valued-functions)
     - [Internal Virtual Tables](#internal-virtual-tables)
 
-## Overview
+## Guarantees
 
-Turso aims to be fully compatible with SQLite, with opt-in features not supported by SQLite.
+1. You should always be able to go back to SQLite if you want to.
+2. You should be able to access a database created with SQLite in Turso.
+3. You need to opt in to any incompatible Turso feature, but even then we provide a migration path back to SQLite when possible.
+4. We don't support mixed SQLite and Turso in multi-process scenarios.
+
+## Overview
 
 ### Features
 
@@ -167,7 +179,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA journal_size_limit        | ❌ No         |                                              |
 | PRAGMA legacy_alter_table        | ❌ No         |                                              |
 | PRAGMA legacy_file_format        | ✅ Yes        |                                              |
-| PRAGMA locking_mode              | ❌ No         |                                              |
+| PRAGMA locking_mode              | 🚧 Partial    | `EXCLUSIVE` only                             |
 | PRAGMA max_page_count            | ✅ Yes        |                                              |
 | PRAGMA mmap_size                 | ❌ No         |                                              |
 | PRAGMA module_list               | ❌ No         |                                              |
@@ -472,9 +484,9 @@ Modifiers:
 | sqlite3_step                | ✅ Yes     |         |
 | sqlite3_reset               | ✅ Yes     |         |
 | sqlite3_exec                | ✅ Yes     |         |
-| sqlite3_stmt_readonly       | ❌ No      | Stub    |
+| sqlite3_stmt_readonly       | ✅ Yes     |         |
 | sqlite3_stmt_busy           | ❌ No      | Stub    |
-| sqlite3_stmt_status         | ❌ No      |         |
+| sqlite3_stmt_status         | 🚧 Partial | Supports `FULLSCAN_STEP`, `SORT`, `VM_STEP`, `REPREPARE`, `LIBSQL_STMTSTATUS_ROWS_READ`, and `LIBSQL_STMTSTATUS_ROWS_WRITTEN`. Returns `0` for `AUTOINDEX`, `RUN`, `FILTER_MISS`, `FILTER_HIT`, and `MEMUSED`. |
 | sqlite3_sql                 | ❌ No      |         |
 | sqlite3_expanded_sql        | ❌ No      | Stub    |
 | sqlite3_normalized_sql      | ❌ No      |         |
@@ -520,7 +532,7 @@ Modifiers:
 | sqlite3_column_blob      | ✅ Yes     |         |
 | sqlite3_column_bytes     | ✅ Yes     |         |
 | sqlite3_column_bytes16   | ❌ No      |         |
-| sqlite3_column_value     | ❌ No      |         |
+| sqlite3_column_value     | ✅ Yes     |         |
 | sqlite3_column_table_name| ✅ Yes     |         |
 | sqlite3_column_database_name | ❌ No  |         |
 | sqlite3_column_origin_name | ❌ No    |         |
@@ -539,8 +551,8 @@ Modifiers:
 | sqlite3_value_blob     | ✅ Yes     |         |
 | sqlite3_value_bytes    | ✅ Yes     |         |
 | sqlite3_value_bytes16  | ❌ No      |         |
-| sqlite3_value_dup      | ❌ No      |         |
-| sqlite3_value_free     | ❌ No      |         |
+| sqlite3_value_dup      | ✅ Yes     |         |
+| sqlite3_value_free     | ✅ Yes     |         |
 | sqlite3_value_nochange | ❌ No      |         |
 | sqlite3_value_frombind | ❌ No      |         |
 | sqlite3_value_subtype  | ❌ No      |         |
@@ -595,7 +607,7 @@ Modifiers:
 | sqlite3_busy_handler     | ✅ Yes     |         |
 | sqlite3_busy_timeout     | ✅ Yes     |         |
 | sqlite3_trace_v2         | ❌ No      | Stub    |
-| sqlite3_progress_handler | ❌ No      | Stub    |
+| sqlite3_progress_handler | ✅ Yes     | Step-time callbacks only |
 | sqlite3_set_authorizer   | ❌ No      | Stub    |
 | sqlite3_commit_hook      | ❌ No      |         |
 | sqlite3_rollback_hook    | ❌ No      |         |
@@ -614,7 +626,7 @@ Modifiers:
 | sqlite3_create_window_function | ❌ No    | Stub    |
 | sqlite3_aggregate_context    | ❌ No      | Stub    |
 | sqlite3_user_data            | ❌ No      | Stub    |
-| sqlite3_context_db_handle    | ❌ No      | Stub    |
+| sqlite3_context_db_handle    | ✅ Yes     |         |
 | sqlite3_get_auxdata          | ❌ No      |         |
 | sqlite3_set_auxdata          | ❌ No      |         |
 | sqlite3_result_null          | ❌ No      | Stub    |
@@ -688,7 +700,7 @@ Modifiers:
 | sqlite3_sourceid       | ❌ No      |         |
 | sqlite3_threadsafe     | ✅ Yes     | Returns 1 |
 | sqlite3_complete       | ❌ No      | Stub    |
-| sqlite3_interrupt      | ❌ No      | Stub    |
+| sqlite3_interrupt      | ✅ Yes     |         |
 | sqlite3_sleep          | ❌ No      | Stub    |
 | sqlite3_randomness     | ❌ No      |         |
 | sqlite3_get_table      | ✅ Yes     |         |

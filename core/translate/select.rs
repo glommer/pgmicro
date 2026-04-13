@@ -123,8 +123,10 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     }
     for subquery in &select_plan.non_from_clause_subqueries {
         if let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state {
-            if let Some(name) = select_plan_first_virtual_table_name(plan) {
-                return Some(name);
+            if let Plan::Select(plan) = plan.as_ref() {
+                if let Some(name) = select_plan_first_virtual_table_name(plan) {
+                    return Some(name);
+                }
             }
         }
     }
@@ -206,29 +208,19 @@ pub fn prepare_select_plan(
 
             // Parse ORDER BY for compound selects.
             // ORDER BY can reference columns by number (1-based) or by name/alias
-            // from the leftmost SELECT's result columns.
-            let leftmost_plan = &left[0].0;
-            let leftmost_result_columns = &leftmost_plan.result_columns;
-            let leftmost_table_refs = &leftmost_plan.table_references;
+            // from any constituent SELECT's result columns.
+            let all_plans: Vec<&SelectPlan> = left
+                .iter()
+                .map(|(plan, _)| plan)
+                .chain(std::iter::once(&last))
+                .collect();
             let order_by = if select.order_by.is_empty() {
                 None
             } else {
-                if select
-                    .order_by
-                    .iter()
-                    .filter_map(|o| o.nulls)
-                    .any(|n| n == ast::NullsOrder::Last)
-                {
-                    crate::bail_parse_error!("NULLS LAST is not supported yet in ORDER BY");
-                }
                 let mut key = Vec::with_capacity(select.order_by.len());
-                for o in &select.order_by {
-                    let col_idx = resolve_compound_order_by_expr(
-                        &o.expr,
-                        leftmost_result_columns,
-                        leftmost_table_refs,
-                    )?;
-                    key.push((col_idx, o.order.unwrap_or(ast::SortOrder::Asc)));
+                for (i, o) in select.order_by.iter().enumerate() {
+                    let col_idx = resolve_compound_order_by_expr(&o.expr, &all_plans, i + 1)?;
+                    key.push((col_idx, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
                 }
                 Some(key)
             };
@@ -256,13 +248,6 @@ fn prepare_one_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
-    if order_by
-        .iter()
-        .filter_map(|o| o.nulls)
-        .any(|n| n == ast::NullsOrder::Last)
-    {
-        crate::bail_parse_error!("NULLS LAST is not supported yet in ORDER BY");
-    }
     match select {
         ast::OneSelect::Select {
             columns,
@@ -379,7 +364,7 @@ fn prepare_one_select_plan(
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
-                for (expr, _) in window.order_by.iter_mut() {
+                for (expr, _, _) in window.order_by.iter_mut() {
                     bind_and_rewrite_expr(
                         expr,
                         Some(&mut plan.table_references),
@@ -392,6 +377,8 @@ fn prepare_one_select_plan(
                 windows.push(window);
             }
 
+            let long_names =
+                connection.get_full_column_names() && !connection.get_short_column_names();
             let mut aggregate_expressions = Vec::new();
             for column in columns.into_iter() {
                 match column {
@@ -400,7 +387,8 @@ fn prepare_one_select_plan(
                             plan.table_references.joined_tables(),
                             &mut plan.result_columns,
                             plan.table_references.right_join_swapped(),
-                        );
+                            long_names,
+                        )?;
                         for table in plan.table_references.joined_tables_mut() {
                             for idx in 0..table.columns().len() {
                                 let column = &table.columns()[idx];
@@ -413,6 +401,34 @@ fn prepare_one_select_plan(
                     }
                     ResultColumn::TableStar(name) => {
                         let name_normalized = normalize_ident(name.as_str());
+                        // If this table identifier appears more than once in the FROM
+                        // clause, `A.*` is ambiguous (matches SQLite behavior).
+                        let dup_count = plan
+                            .table_references
+                            .joined_tables()
+                            .iter()
+                            .filter(|t| t.identifier == name_normalized)
+                            .count();
+                        if dup_count > 1 {
+                            let first_tbl = plan
+                                .table_references
+                                .joined_tables()
+                                .iter()
+                                .find(|t| t.identifier == name_normalized)
+                                .unwrap(); // safe: dup_count > 1 guarantees a match
+                            let col_name = first_tbl
+                                .columns()
+                                .iter()
+                                .find(|c| !c.hidden())
+                                .and_then(|c| c.name.as_ref())
+                                .map(|n| n.as_str())
+                                .unwrap_or("?");
+                            crate::bail_parse_error!(
+                                "ambiguous column name: {}.{}",
+                                name.as_str(),
+                                col_name
+                            );
+                        }
                         let referenced_table = plan
                             .table_references
                             .joined_tables_mut()
@@ -429,6 +445,13 @@ fn prepare_one_select_plan(
                             if column.hidden() {
                                 continue;
                             }
+                            let alias = column.name.as_ref().map(|col_name| {
+                                if long_names {
+                                    format!("{}.{}", table.identifier, col_name)
+                                } else {
+                                    col_name.clone()
+                                }
+                            });
                             plan.result_columns.push(ResultSetColumn {
                                 expr: ast::Expr::Column {
                                     database: None, // TODO: support different databases
@@ -436,7 +459,8 @@ fn prepare_one_select_plan(
                                     column: idx,
                                     is_rowid_alias: column.is_rowid_alias(),
                                 },
-                                alias: None,
+                                alias,
+                                implicit_column_name: None,
                                 contains_aggregates: false,
                             });
                             table.mark_column_used(idx);
@@ -456,11 +480,18 @@ fn prepare_one_select_plan(
                             &mut aggregate_expressions,
                             Some(&mut windows),
                         )?;
+                        let (alias, implicit_column_name) = match &maybe_alias {
+                            Some(ast::As::As(name)) | Some(ast::As::Elided(name)) => {
+                                (Some(name.as_str().to_string()), None)
+                            }
+                            Some(ast::As::ImplicitColumnName(name)) => {
+                                (None, Some(name.as_str().to_string()))
+                            }
+                            None => (None, None),
+                        };
                         plan.result_columns.push(ResultSetColumn {
-                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                ast::As::Elided(alias) => alias.as_str().to_string(),
-                                ast::As::As(alias) => alias.as_str().to_string(),
-                            }),
+                            alias,
+                            implicit_column_name,
                             expr: *expr,
                             contains_aggregates,
                         });
@@ -503,7 +534,11 @@ fn prepare_one_select_plan(
                 if !group_by.exprs.is_empty() {
                     // Normal GROUP BY with expressions
                     for expr in group_by.exprs.iter_mut() {
-                        replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
+                        replace_column_number_with_copy_of_column_expr(
+                            expr,
+                            &plan.result_columns,
+                            "GROUP BY",
+                        )?;
                         bind_and_rewrite_expr(
                             expr,
                             Some(&mut plan.table_references),
@@ -515,6 +550,7 @@ fn prepare_one_select_plan(
 
                     plan.group_by = Some(GroupBy {
                         sort_order: Vec::new(),
+                        nulls_order: Vec::new(),
                         sort_elided: false,
                         exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
                         having: having_predicates,
@@ -523,6 +559,7 @@ fn prepare_one_select_plan(
                     // HAVING without GROUP BY: treat as ungrouped aggregation with filter
                     plan.group_by = Some(GroupBy {
                         sort_order: Vec::new(),
+                        nulls_order: Vec::new(),
                         sort_elided: false,
                         exprs: vec![],
                         having: having_predicates,
@@ -551,7 +588,11 @@ fn prepare_one_select_plan(
                 .is_some_and(|gb| !gb.exprs.is_empty());
 
             for mut o in order_by {
-                replace_column_number_with_copy_of_column_expr(&mut o.expr, &plan.result_columns)?;
+                replace_column_number_with_copy_of_column_expr(
+                    &mut o.expr,
+                    &plan.result_columns,
+                    "ORDER BY",
+                )?;
 
                 bind_and_rewrite_expr(
                     &mut o.expr,
@@ -578,7 +619,7 @@ fn prepare_one_select_plan(
                     crate::bail_parse_error!("misuse of aggregate: {}()", agg.func);
                 }
 
-                key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
+                key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
             }
             // Remove duplicate ORDER BY expressions, keeping the first occurrence.
             // Duplicates are semantically redundant.
@@ -586,7 +627,7 @@ fn prepare_one_select_plan(
             while i < key.len() {
                 if key[..i]
                     .iter()
-                    .any(|(prev, _)| exprs_are_equivalent(prev, &key[i].0))
+                    .any(|(prev, _, _)| exprs_are_equivalent(prev, &key[i].0))
                 {
                     key.remove(i);
                 } else {
@@ -633,7 +674,7 @@ fn prepare_one_select_plan(
             if let Some(group_by) = &mut plan.group_by {
                 // now that we have resolved the ORDER BY expressions and aggregates, we can
                 // compute the necessary sort order for the GROUP BY clause
-                group_by.sort_order = compute_group_by_sort_order(
+                (group_by.sort_order, group_by.nulls_order) = compute_group_by_sort_order(
                     &group_by.exprs,
                     &plan.order_by,
                     &plan.aggregates,
@@ -680,6 +721,7 @@ fn prepare_one_select_plan(
                     // these result_columns work as placeholders for the values, so the expr doesn't matter
                     expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
                     alias: Some(format!("column{}", i + 1)),
+                    implicit_column_name: None,
                     contains_aggregates: false,
                 });
             }
@@ -754,7 +796,7 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
             crate::bail_parse_error!("result column must return 1 value, got {}", vec_size);
         }
     }
-    for (expr, _) in plan.order_by.iter() {
+    for (expr, _, _) in plan.order_by.iter() {
         let vec_size = expr_vector_size(expr)?;
         if vec_size != 1 {
             crate::bail_parse_error!("order by expression must return 1 value, got {}", vec_size);
@@ -887,7 +929,7 @@ fn reject_outer_query_refs_in_group_by_expr(
                 else {
                     unreachable!("GROUP BY subquery must be in unevaluated state during planning");
                 };
-                reject_outer_scope_refs_inside_select_plan(subquery_plan, table_references)?;
+                reject_outer_scope_refs_inside_plan_tree(subquery_plan, table_references)?;
             }
             _ => {}
         }
@@ -953,7 +995,7 @@ fn reject_outer_scope_refs_inside_select_plan(
         else {
             continue;
         };
-        reject_outer_scope_refs_inside_select_plan(subquery_plan, current_scope_table_refs)?;
+        reject_outer_scope_refs_inside_plan_tree(subquery_plan, current_scope_table_refs)?;
     }
 
     for joined_table in plan.table_references.joined_tables().iter() {
@@ -1026,6 +1068,7 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
 fn replace_column_number_with_copy_of_column_expr(
     order_by_or_group_by_expr: &mut ast::Expr,
     columns: &[ResultSetColumn],
+    clause_name: &str,
 ) -> Result<()> {
     // Extract the numeric literal string, handling both bare integers (e.g. `2`)
     // and unary-plus integers (e.g. `+2`). In SQLite, `ORDER BY +2` strips the
@@ -1043,7 +1086,8 @@ fn replace_column_number_with_copy_of_column_expr(
             if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
                 if num.parse::<usize>().is_ok() {
                     crate::bail_parse_error!(
-                        "1st ORDER BY term out of range - should be between 1 and {}",
+                        "1st {} term out of range - should be between 1 and {}",
+                        clause_name,
                         columns.len()
                     );
                 }
@@ -1058,7 +1102,8 @@ fn replace_column_number_with_copy_of_column_expr(
         if let Ok(column_number) = num.parse::<usize>() {
             if column_number == 0 || column_number > columns.len() {
                 crate::bail_parse_error!(
-                    "1st ORDER BY term out of range - should be between 1 and {}",
+                    "1st {} term out of range - should be between 1 and {}",
+                    clause_name,
                     columns.len()
                 );
             }
@@ -1073,60 +1118,79 @@ fn replace_column_number_with_copy_of_column_expr(
 /// Resolves a compound SELECT ORDER BY expression to a 0-based column index.
 /// ORDER BY in compound selects can reference columns by:
 /// 1. Numeric position (1-based): ORDER BY 1
-/// 2. Column name or alias from the leftmost SELECT: ORDER BY name
+/// 2. Column name or alias from any constituent SELECT: ORDER BY name
 fn resolve_compound_order_by_expr(
     expr: &ast::Expr,
-    result_columns: &[ResultSetColumn],
-    table_references: &TableReferences,
+    all_plans: &[&SelectPlan],
+    term_number: usize,
 ) -> Result<usize> {
+    let num_result_columns = all_plans[0].result_columns.len();
     match expr {
         // Case 1: Numeric column reference (e.g., ORDER BY 1)
         ast::Expr::Literal(ast::Literal::Numeric(num)) => {
             if let Ok(column_number) = num.parse::<usize>() {
-                if column_number == 0 || column_number > result_columns.len() {
+                if column_number == 0 || column_number > num_result_columns {
                     crate::bail_parse_error!(
                         "{} ORDER BY term out of range - should be between 1 and {}",
                         column_number,
-                        result_columns.len()
+                        num_result_columns
                     );
                 }
                 Ok(column_number - 1)
             } else {
                 crate::bail_parse_error!(
-                    "ORDER BY expression in compound SELECT must be a column number or name"
+                    "{} ORDER BY term does not match any column in the result set",
+                    ordinal(term_number)
                 );
             }
         }
         // Case 2: Name reference (e.g., ORDER BY name or ORDER BY alias)
         ast::Expr::Id(name) => {
             let name_normalized = normalize_ident(name.as_str());
-            // First try matching against aliases
-            for (i, rc) in result_columns.iter().enumerate() {
-                if let Some(alias) = &rc.alias {
-                    if normalize_ident(alias) == name_normalized {
-                        return Ok(i);
+            // Check aliases and column names across all constituent SELECTs
+            for plan in all_plans {
+                let result_columns = &plan.result_columns;
+                let table_references = &plan.table_references;
+                // Try matching against aliases
+                for (i, rc) in result_columns.iter().enumerate() {
+                    if let Some(alias) = &rc.alias {
+                        if normalize_ident(alias) == name_normalized {
+                            return Ok(i);
+                        }
                     }
                 }
-            }
-            // Then try matching against column names from the table references
-            for (i, rc) in result_columns.iter().enumerate() {
-                if let Some(col_name) = rc.name(table_references) {
-                    if normalize_ident(col_name) == name_normalized {
-                        return Ok(i);
+                // Try matching against column names from the table references
+                for (i, rc) in result_columns.iter().enumerate() {
+                    if let Some(col_name) = rc.name(table_references) {
+                        if normalize_ident(col_name) == name_normalized {
+                            return Ok(i);
+                        }
                     }
                 }
             }
             crate::bail_parse_error!(
-                "ORDER BY term \"{}\" does not match any result column",
-                name.as_str()
+                "{} ORDER BY term does not match any column in the result set",
+                ordinal(term_number)
             );
         }
         _ => {
             crate::bail_parse_error!(
-                "ORDER BY expression in compound SELECT must be a column number or name"
+                "{} ORDER BY term does not match any column in the result set",
+                ordinal(term_number)
             );
         }
     }
+}
+
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (1, 11) | (2, 12) | (3, 13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
 }
 
 /// Count required cursors for a Plan (either Select or CompoundSelect)

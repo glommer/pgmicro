@@ -11,5 +11,6 @@
       "#index": ["./index.js"]
     }
   },
-  "include": ["*.ts"]
+  "include": ["*.ts"],
+  "exclude": ["*.test.ts"]
 }

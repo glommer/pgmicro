@@ -23,11 +23,15 @@
     "dist/**"
   ],
   "scripts": {
+    "napi-build": "npx napi build --platform --esm --features default-postgres --manifest-path ../../bindings/javascript/Cargo.toml --output-dir . && python3 ../../npm/rename-node.py .",
     "tsc-build": "npx tsc",
+    "build": "npm run napi-build && npm run tsc-build",
+    "test": "vitest --run",
     "prepack": "cp ../../README.md . 2>/dev/null || true"
   },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   },
   "dependencies": {
     "@tursodatabase/database-common": "^0.6.0-pre.7"
@@ -36,6 +40,14 @@
     "pg-micro-darwin-arm64": "0.0.3",
     "pg-micro-linux-x64-gnu": "0.0.3",
     "pg-micro-linux-arm64-gnu": "0.0.3"
+  },
+  "napi": {
+    "binaryName": "pgmicro",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]
   },
   "imports": {
     "#index": "./index.js"

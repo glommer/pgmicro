@@ -542,6 +542,7 @@ fn plan_cte(
             cte_id: Some(cte_definitions[ref_idx].cte_id),
             cte_definition_only: false,
             rowid_referenced: false,
+            scope_depth: 0,
         });
     }
 
@@ -579,10 +580,7 @@ fn plan_cte(
         // Validate explicit column count only on actual references (matching SQLite behavior,
         // which defers this check until the CTE is used).
         if let Some(cols) = explicit_cols {
-            let result_col_count = cte_plan
-                .select_result_columns()
-                .expect("should be a select plan")
-                .len();
+            let result_col_count = cte_plan.select_result_columns().len();
             if cols.len() != result_col_count {
                 crate::bail_parse_error!(
                     "table {} has {} columns but {} column names were provided",
@@ -715,6 +713,7 @@ pub fn plan_ctes_as_outer_refs(
             cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
             cte_definition_only: true,
             rowid_referenced: false,
+            scope_depth: 0,
         });
     }
 
@@ -784,6 +783,7 @@ fn parse_from_clause_table(
                     cte_id: Some(cte_def.cte_id),
                     cte_definition_only: false,
                     rowid_referenced: false,
+                    scope_depth: 0,
                 });
             }
 
@@ -805,12 +805,8 @@ fn parse_from_clause_table(
             }
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
-                .map(|a| match a {
-                    ast::As::As(id) => id,
-                    ast::As::Elided(id) => id,
-                })
-                .map(|id| normalize_ident(id.as_str()))
-                .unwrap_or_else(|| format!("subquery_{cur_table_index}"));
+                .map(|a| normalize_ident(a.name().as_str()))
+                .unwrap_or_else(|| format!("(subquery-{cur_table_index})"));
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
                 subplan,
@@ -878,11 +874,7 @@ fn parse_table(
 
         // If there's an alias provided, update the identifier to use that alias
         if let Some(a) = maybe_alias {
-            let alias = match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            };
-            cte_table.identifier = normalize_ident(alias.as_str());
+            cte_table.identifier = normalize_ident(a.name().as_str());
         }
 
         // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
@@ -913,12 +905,7 @@ fn parse_table(
         if let Some(cte_id) = outer_ref.cte_id {
             program.increment_cte_reference(cte_id);
         }
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         // Clone fields we need before dropping the borrow on table_references.
         let cte_select = outer_ref.cte_select.clone();
         let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
@@ -949,10 +936,7 @@ fn parse_table(
             // Validate explicit column count on actual CTE reference (matching SQLite
             // behavior, which defers this check until the CTE is used).
             if let Some(cols) = explicit_cols {
-                let result_col_count = cte_plan
-                    .select_result_columns()
-                    .expect("should be a select plan")
-                    .len();
+                let result_col_count = cte_plan.select_result_columns().len();
                 if cols.len() != result_col_count {
                     crate::bail_parse_error!(
                         "table {} has {} columns but {} column names were provided",
@@ -1003,12 +987,7 @@ fn parse_table(
     });
 
     if let Some(table) = table {
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -1132,12 +1111,7 @@ fn parse_table(
         });
         drop(view_guard);
 
-        let alias = maybe_alias
-            .map(|a| match a {
-                ast::As::As(id) => id,
-                ast::As::Elided(id) => id,
-            })
-            .map(|a| normalize_ident(a.as_str()));
+        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -1373,6 +1347,7 @@ pub fn parse_from(
                     // this scope's FROM/JOIN clause.
                     cte_definition_only: true,
                     rowid_referenced: false,
+                    scope_depth: 0,
                 });
             }
         }
@@ -1670,18 +1645,12 @@ pub fn table_mask_from_expr(
                 };
                 match &subquery.state {
                     SubqueryState::Unevaluated { plan } => {
-                        let used_outer_query_refs = plan
-                            .as_ref()
-                            .unwrap()
-                            .table_references
-                            .outer_query_refs()
-                            .iter()
-                            .filter(|t| t.is_used());
-                        for outer_query_ref in used_outer_query_refs {
+                        let outer_ref_ids = plan.as_ref().unwrap().used_outer_query_ref_ids();
+                        for outer_ref_id in &outer_ref_ids {
                             if let Some(table_idx) = table_references
                                 .joined_tables()
                                 .iter()
-                                .position(|t| t.internal_id == outer_query_ref.internal_id)
+                                .position(|t| t.internal_id == *outer_ref_id)
                             {
                                 mask.add_table(table_idx);
                             }
@@ -1765,17 +1734,11 @@ pub fn determine_where_to_eval_expr(
                         eval_at = eval_at.max(*evaluated_at);
                     }
                     SubqueryState::Unevaluated { plan } => {
-                        let used_outer_refs = plan
-                            .as_ref()
-                            .unwrap()
-                            .table_references
-                            .outer_query_refs()
-                            .iter()
-                            .filter(|t| t.is_used());
-                        for outer_ref in used_outer_refs {
+                        let outer_ref_ids = plan.as_ref().unwrap().used_outer_query_ref_ids();
+                        for outer_ref_id in &outer_ref_ids {
                             let join_idx = join_order
                                 .iter()
-                                .position(|t| t.table_id == outer_ref.internal_id)
+                                .position(|t| t.table_id == *outer_ref_id)
                                 .or_else(|| {
                                     let tables = table_references?;
                                     for (probe_idx, member) in join_order.iter().enumerate() {
@@ -1784,7 +1747,7 @@ pub fn determine_where_to_eval_expr(
                                         if let Operation::HashJoin(ref hj) = probe_table.op {
                                             let build_table =
                                                 &tables.joined_tables()[hj.build_table_idx];
-                                            if build_table.internal_id == outer_ref.internal_id {
+                                            if build_table.internal_id == *outer_ref_id {
                                                 return Some(probe_idx);
                                             }
                                         }
@@ -1873,27 +1836,9 @@ fn parse_join(
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
     }
 
-    // this is called once for each join, so we only need to check the rightmost table
-    // against all previous tables for duplicates
+    // SQLite allows duplicate table names/aliases in FROM clauses.
+    // Ambiguity is detected later during column resolution.
     let rightmost_table = table_references.joined_tables().last().unwrap();
-    let has_duplicate = table_references
-        .joined_tables()
-        .iter()
-        .take(table_references.joined_tables().len() - 1)
-        .any(|t| t.identifier == rightmost_table.identifier);
-
-    if has_duplicate
-        && !natural
-        && constraint
-            .as_ref()
-            .is_none_or(|c| !matches!(c, ast::JoinConstraint::Using(_)))
-    {
-        // Duplicate table names are only allowed for NATURAL or USING joins
-        crate::bail_parse_error!(
-            "table name {} specified more than once - use an alias to disambiguate",
-            rightmost_table.identifier
-        );
-    }
     let constraint = if natural {
         turso_assert_greater_than_or_equal!(table_references.joined_tables().len(), 2);
         // NATURAL JOIN is first transformed into a USING join with the common columns

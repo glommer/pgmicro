@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - turso-only
 
 # Add permissions needed for OIDC authentication with AWS
 permissions:

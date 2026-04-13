@@ -3,9 +3,9 @@ name: Rust Benchmarks+Nyrkiö
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "notmain"]
+    branches: ["turso-only"]
   pull_request:
-    branches: ["main", "notmain"]
+    branches: ["turso-only"]
 
 env:
   CARGO_TERM_COLOR: never

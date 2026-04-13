@@ -9,7 +9,6 @@ use super::{
     },
     planner::TableMask,
 };
-use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::MultiIndexBranchAccess;
 use crate::{
@@ -48,6 +47,7 @@ use crate::{
     },
     LimboError, Result,
 };
+use crate::{schema::GeneratedType, MAIN_DB_ID};
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint,
@@ -134,7 +134,11 @@ fn try_match_index_method_pattern(
     pattern: &ast::Select,
     table: &JoinedTable,
     query_where_terms: &[WhereTerm],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
     pattern_idx: usize,
@@ -219,10 +223,15 @@ fn try_match_index_method_pattern(
 
     // Match ORDER BY if pattern has it
     if pattern_has_order_by {
-        for (pattern_column, (query_column, query_order)) in
+        for (pattern_column, (query_column, query_order, query_nulls)) in
             pattern.order_by.iter().zip(order_by.iter())
         {
             if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
+                return None;
+            }
+            // If the query has explicit NULLS ordering, the index pattern cannot
+            // satisfy it (index methods have no NULLS awareness).
+            if query_nulls.is_some() {
                 return None;
             }
             let num_col_args = count_fts_column_args(&pattern_column.expr);
@@ -344,7 +353,11 @@ fn collect_index_method_candidates(
     table_references: &TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &[WhereTerm],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
     group_by: &Option<GroupBy>,
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
@@ -633,11 +646,16 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     // unnesting sees the plan without an artificial LIMIT.
     for sub in &mut plan.non_from_clause_subqueries {
         if matches!(sub.query_type, ast::SubqueryType::Exists { .. }) {
-            if let SubqueryState::Unevaluated { plan: Some(inner) } = &mut sub.state {
-                if inner.limit.is_none() {
-                    inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
-                        "1".to_string(),
-                    ))));
+            if let SubqueryState::Unevaluated {
+                plan: Some(inner), ..
+            } = &mut sub.state
+            {
+                if let Plan::Select(ref mut inner) = inner.as_mut() {
+                    if inner.limit.is_none() {
+                        inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
+                            "1".to_string(),
+                        ))));
+                    }
                 }
             }
         }
@@ -965,7 +983,7 @@ fn add_ephemeral_table_to_update_plan(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             indexed: None,
         }],
         vec![],
@@ -989,6 +1007,7 @@ fn add_ephemeral_table_to_update_plan(
                 cte_id: None,
                 cte_definition_only: false,
                 rowid_referenced: false,
+                scope_depth: 0,
             });
     }
 
@@ -1025,6 +1044,7 @@ fn add_ephemeral_table_to_update_plan(
                 table: rowid_internal_id,
             },
             alias: None,
+            implicit_column_name: None,
             contains_aggregates: false,
         }],
         where_clause: plan.where_clause.drain(..).collect(),
@@ -1131,6 +1151,9 @@ fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> R
         else {
             continue;
         };
+        let Plan::Select(ref mut inner_plan) = inner_plan.as_mut() else {
+            continue;
+        };
         if !select_plan_contains_cte_from_clause_subquery(inner_plan) {
             continue;
         }
@@ -1182,7 +1205,11 @@ fn optimize_table_access_with_custom_modules(
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_query: &mut [WhereTerm],
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )>,
     group_by: &mut Option<GroupBy>,
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
@@ -1303,14 +1330,18 @@ fn optimize_table_access_with_custom_modules(
 fn register_expression_index_usages_for_plan(
     table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
     group_by: Option<&GroupBy>,
 ) {
     table_references.reset_expression_index_usages();
     for rc in result_columns {
         table_references.register_expression_index_usage(&rc.expr);
     }
-    for (expr, _) in order_by {
+    for (expr, _, _) in order_by {
         table_references.register_expression_index_usage(expr);
     }
     if let Some(group_by) = group_by {
@@ -1574,7 +1605,11 @@ fn optimize_table_access(
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )>,
     group_by: &mut Option<GroupBy>,
     simple_aggregate: Option<&SimpleAggregate>,
     subqueries: &[NonFromClauseSubquery],
@@ -3404,7 +3439,7 @@ fn build_seek_def(
 #[cfg(test)]
 mod tests {
     use super::{where_term_is_null_rejecting_for_table, Optimizable};
-    use crate::translate::emitter::Resolver;
+    use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
@@ -3415,7 +3450,14 @@ mod tests {
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
-        Resolver::new(schema, database_schemas, attached_databases, syms, true)
+        Resolver::new(
+            schema,
+            database_schemas,
+            attached_databases,
+            syms,
+            true,
+            DoubleQuotedDml::Enabled,
+        )
     }
 
     fn no_tail() -> FunctionTail {

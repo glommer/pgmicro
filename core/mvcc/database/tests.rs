@@ -3,25 +3,34 @@ use rustc_hash::FxHashSet as HashSet;
 use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
-use crate::mvcc::cursor::MvccCursorType;
-use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
+use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
+use crate::mvcc::persistent_storage::logical_log::{
+    ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
+};
+use crate::mvcc::yield_hooks::YieldPointMarker;
+use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
 };
 use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::Mutex;
 use crate::sync::RwLock;
-use crate::{Buffer, Completion, DatabaseOpts, OpenFlags};
+use crate::{Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
+const TX_HEADER_SIZE: usize = 24;
+const TX_TRAILER_SIZE: usize = 8;
+
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
     path: Option<String>,
     opts: DatabaseOpts,
+    enc_opts: Option<crate::EncryptionOpts>,
     // Stored mainly to not drop the temp dir before the test is done.
     _temp_dir: Option<tempfile::TempDir>,
 }
@@ -29,6 +38,25 @@ pub(crate) struct MvccTestDb {
     pub(crate) mvcc_store: Arc<MvStore<MvccClock>>,
     pub(crate) db: Arc<Database>,
     pub(crate) conn: Arc<Connection>,
+}
+
+#[derive(Debug)]
+struct FixedYieldInjector {
+    remaining: Mutex<HashSet<YieldPoint>>,
+}
+
+impl FixedYieldInjector {
+    fn new(points: impl IntoIterator<Item = YieldPoint>) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: Mutex::new(points.into_iter().collect()),
+        })
+    }
+}
+
+impl YieldInjector for FixedYieldInjector {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        self.remaining.lock().remove(&point)
+    }
 }
 
 impl MvccTestDb {
@@ -61,6 +89,7 @@ impl MvccTestDbNoConn {
             db: Some(db),
             path: None,
             opts,
+            enc_opts: None,
             _temp_dir: None,
         }
     }
@@ -95,25 +124,120 @@ impl MvccTestDbNoConn {
             db: Some(db),
             path: Some(path.to_str().unwrap().to_string()),
             opts,
+            enc_opts: None,
+            _temp_dir: Some(temp_dir),
+        }
+    }
+
+    /// Opens a file-backed encrypted database with the given hex key.
+    pub fn new_encrypted(hex_key: &str) -> Self {
+        let opts = DatabaseOpts::new().with_encryption(true);
+        let enc_opts = crate::EncryptionOpts {
+            cipher: "aes256gcm".to_string(),
+            hexkey: hex_key.to_string(),
+        };
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.as_os_str().to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            Some(enc_opts.clone()),
+        )
+        .unwrap();
+        let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
+        let conn = db.connect_with_encryption(Some(encryption_key)).unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        Self {
+            db: Some(db),
+            path: Some(path.to_str().unwrap().to_string()),
+            opts,
+            enc_opts: Some(enc_opts),
             _temp_dir: Some(temp_dir),
         }
     }
 
     /// Restarts the database, make sure there is no connection to the database open before calling this!
     pub fn restart(&mut self) {
+        self.restart_result().unwrap();
+    }
+
+    /// Creates a file-backed MVCC test database, randomly picking a cipher
+    /// when `encrypted` is true.
+    pub fn new_maybe_encrypted(encrypted: bool) -> Self {
+        if !encrypted {
+            return Self::new_with_random_db();
+        }
+        const KEY128: &str = "b1bbfda4f589dc9daaf004fe21111e00";
+        const KEY256: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+        let ciphers: &[(&str, &str)] = &[
+            ("aes128gcm", KEY128),
+            ("aes256gcm", KEY256),
+            ("aegis128l", KEY128),
+            ("aegis128x2", KEY128),
+            ("aegis128x4", KEY128),
+            ("aegis256", KEY256),
+            ("aegis256x2", KEY256),
+            ("aegis256x4", KEY256),
+        ];
+        let (cipher, hexkey) = ciphers[rand::random_range(0..ciphers.len())];
+        Self::new_encrypted_with_cipher(hexkey, cipher)
+    }
+
+    fn new_encrypted_with_cipher(hex_key: &str, cipher: &str) -> Self {
+        let opts = DatabaseOpts::new().with_encryption(true);
+        let enc_opts = crate::EncryptionOpts {
+            cipher: cipher.to_string(),
+            hexkey: hex_key.to_string(),
+        };
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.as_os_str().to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            Some(enc_opts.clone()),
+        )
+        .unwrap();
+        let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
+        let conn = db.connect_with_encryption(Some(encryption_key)).unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        Self {
+            db: Some(db),
+            path: Some(path.to_str().unwrap().to_string()),
+            opts,
+            enc_opts: Some(enc_opts),
+            _temp_dir: Some(temp_dir),
+        }
+    }
+
+    /// Like `restart`, but returns the error instead of panicking.
+    /// Useful for testing wrong-key scenarios.
+    pub fn restart_result(&mut self) -> crate::Result<()> {
         // First let's clear any entries in database manager in order to force restart.
         // If not, we will load the same database instance again.
         {
             let mut manager = DATABASE_MANAGER.lock();
             manager.clear();
         }
-
         // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
-        let db = Database::open_file_with_flags(io, path, OpenFlags::default(), self.opts, None)
-            .unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::default(),
+            self.opts,
+            self.enc_opts.clone(),
+        )?;
         self.db.replace(db);
+        Ok(())
     }
 
     /// Asumes there is a database open
@@ -122,7 +246,11 @@ impl MvccTestDbNoConn {
     }
 
     pub fn connect(&self) -> Arc<Connection> {
-        self.get_db().connect().unwrap()
+        let enc_key = self
+            .enc_opts
+            .as_ref()
+            .map(|e| EncryptionKey::from_hex_string(&e.hexkey).unwrap());
+        self.get_db().connect_with_encryption(enc_key).unwrap()
     }
 
     pub fn get_mvcc_store(&self) -> Arc<MvStore<MvccClock>> {
@@ -727,9 +855,9 @@ fn test_journal_mode_switch_from_mvcc_to_wal_without_log_frames() {
 
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_recovery_checkpoint_then_more_writes() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -785,9 +913,9 @@ fn test_restart_with_trigger_rootpage_zero() {
 
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_btree_resident_recovery_then_checkpoint_delete_stays_deleted() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -1352,9 +1480,9 @@ fn test_meta_recovery_case_1_no_wal_no_log_metadata_present_clean_boot() {
 
 /// What this test checks: With no committed WAL and metadata present, replay includes only frames above `persistent_tx_ts_max`.
 /// Why this matters: This is the core idempotency contract for logical-log replay.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_meta_recovery_case_2_no_wal_replay_above_metadata_boundary() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -1393,9 +1521,9 @@ fn test_meta_recovery_case_2_no_wal_replay_above_metadata_boundary() {
 /// then persisted into the database header by checkpoint.
 /// Why this matters: PRAGMA header mutations (for example user_version) must survive restart
 /// both before and after log truncation, including implicit autocommit statement transactions.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_header_only_mutation_is_replayed_and_checkpointed() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
 
     {
         let conn = db.connect();
@@ -2588,6 +2716,54 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
     (db, tx_id, table_id, btree_root_page)
 }
 
+#[test]
+fn test_mvcc_cursor_next_yields_with_injected_yield() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE cursor_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'cursor_yield_test'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::NextStart.point()
+    ])));
+
+    let mut cursor = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(
+            db.conn.pager.load().clone(),
+            root_page.abs(),
+            1,
+        )),
+    )
+    .unwrap();
+
+    let saw_yield = matches!(
+        cursor.next().unwrap(),
+        IOResult::IO(io) if io.is_explicit_yield()
+    );
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+
+    assert!(
+        saw_yield,
+        "MVCC cursor should inject an explicit yield on the first next() transition",
+    );
+}
+
 pub(crate) fn commit_tx(
     mv_store: Arc<MvStore<MvccClock>>,
     conn: &Arc<Connection>,
@@ -2637,6 +2813,7 @@ fn test_lazy_scan_cursor_basic() {
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
+        &db.conn,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -2689,6 +2866,7 @@ fn test_lazy_scan_cursor_with_gaps() {
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
+        &db.conn,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -2748,6 +2926,7 @@ fn test_cursor_basic() {
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
+        &db.conn,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -2811,6 +2990,7 @@ fn test_cursor_with_empty_table() {
     // Test LazyScanCursor with empty table
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
+        &db.conn,
         tx_id,
         table_id,
         MvccCursorType::Table,
@@ -2831,6 +3011,7 @@ fn test_cursor_modification_during_scan() {
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
+        &db.conn,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -3983,58 +4164,60 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     mvcc_store.release_exclusive_tx(&exclusive_tx_id);
 }
 
+/// Insert a synthetic table and a single row via the MVCC store, then commit.
+/// Used by restart / recovery tests to seed durable state before a restart cycle.
+fn write_synthetic_row(db: &MvccTestDbNoConn, value: &str) {
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    let max_root_page = get_rows(
+        &conn,
+        "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let next_schema_rowid = get_rows(
+        &conn,
+        "SELECT COALESCE(MAX(rowid), 0) + 1 FROM sqlite_schema",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let synthetic_root = -(max_root_page + 100);
+    let synthetic_table_id = MVTableId::new(synthetic_root);
+    let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+    let data = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new("table")),
+            Value::Text(Text::new("test")),
+            Value::Text(Text::new("test")),
+            Value::from_i64(synthetic_root),
+            Value::Text(Text::new(
+                "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
+            )),
+        ],
+        5,
+    );
+    mvcc_store
+        .insert(
+            tx_id,
+            Row::new_table_row(
+                RowID::new((-1).into(), RowKey::Int(next_schema_rowid)),
+                data.as_blob().to_vec(),
+                5,
+            ),
+        )
+        .unwrap();
+    let row = generate_simple_string_row(synthetic_table_id, 1, value);
+    mvcc_store.insert(tx_id, row).unwrap();
+    commit_tx(mvcc_store, &conn, tx_id).unwrap();
+    conn.close().unwrap();
+}
+
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_restart() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        let mvcc_store = db.get_mvcc_store();
-        let max_root_page = get_rows(
-            &conn,
-            "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
-        )[0][0]
-            .as_int()
-            .unwrap();
-        let next_schema_rowid = get_rows(
-            &conn,
-            "SELECT COALESCE(MAX(rowid), 0) + 1 FROM sqlite_schema",
-        )[0][0]
-            .as_int()
-            .unwrap();
-        let synthetic_root = -(max_root_page + 100);
-        let synthetic_table_id = MVTableId::new(synthetic_root);
-        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
-        // Insert synthetic table metadata into sqlite_schema (table_id -1).
-        let data = ImmutableRecord::from_values(
-            &[
-                Value::Text(Text::new("table")), // type
-                Value::Text(Text::new("test")),  // name
-                Value::Text(Text::new("test")),  // tbl_name
-                Value::from_i64(synthetic_root), // rootpage
-                Value::Text(Text::new(
-                    "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                )), // sql
-            ],
-            5,
-        );
-        mvcc_store
-            .insert(
-                tx_id,
-                Row::new_table_row(
-                    RowID::new((-1).into(), RowKey::Int(next_schema_rowid)),
-                    data.as_blob().to_vec(),
-                    5,
-                ),
-            )
-            .unwrap();
-        // Now insert a row into the synthetic table.
-        let row = generate_simple_string_row(synthetic_table_id, 1, "foo");
-        mvcc_store.insert(tx_id, row).unwrap();
-        commit_tx(mvcc_store, &conn, tx_id).unwrap();
-        conn.close().unwrap();
-    }
+    write_synthetic_row(&db, "foo");
     db.restart();
 
     {
@@ -4465,9 +4648,9 @@ fn test_select_empty_table() {
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
         let conn = db.connect();
@@ -4489,9 +4672,9 @@ fn test_cursor_with_btree_and_mvcc() {
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_2() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
         let conn = db.connect();
@@ -4517,9 +4700,9 @@ fn test_cursor_with_btree_and_mvcc_2() {
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
         let conn = db.connect();
@@ -4544,9 +4727,9 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
+#[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
         let conn = db.connect();
@@ -4576,10 +4759,10 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
-#[test]
+#[turso_macros::test(encryption)]
 #[ignore] // FIXME: This fails constantly on main and is really annoying, disabling for now :]
 fn test_cursor_with_btree_and_mvcc_fuzz() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     let mut rows_in_db = sorted_vec::SortedVec::new();
     let mut seen = HashSet::default();
     let (mut rng, _seed) = rng_from_time_or_env();
@@ -6563,9 +6746,9 @@ fn test_gc_e2e_checkpointed_row_readable_after_gc() {
 
 /// After deleting a B-tree row and checkpointing, the tombstone is removed
 /// by GC. The deleted row must stay invisible (B-tree no longer has it).
-#[test]
+#[turso_macros::test(encryption)]
 fn test_gc_e2e_deleted_row_stays_hidden_after_gc() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -6599,9 +6782,9 @@ fn test_gc_e2e_deleted_row_stays_hidden_after_gc() {
 
 /// After updating a B-tree row and checkpointing, GC removes old versions.
 /// The updated value must be visible (from B-tree after GC).
-#[test]
+#[turso_macros::test(encryption)]
 fn test_gc_e2e_updated_row_correct_after_gc() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -6763,6 +6946,37 @@ fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<MvStore<
     drop(stmt);
     lock.unlock();
     conn.close().unwrap();
+}
+
+#[test]
+fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        "MVCC commit should yield before completion",
+    );
+
+    drop(stmt);
+    conn.close().unwrap();
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id FROM t WHERE id = 1");
+    assert!(
+        rows.is_empty(),
+        "row from abandoned INSERT commit remained visible: {rows:?}",
+    );
+    observer.close().unwrap();
 }
 
 /// if a txn made some inserts, then aborted (or abandoned due to some IO issue), then those
@@ -7850,4 +8064,438 @@ fn test_committed_update_version_conflict() {
         "Expected WriteWriteConflict, got: {result:?}. \
          Td's committed update must be detected via Td's new version."
     );
+}
+
+/// Encrypted MVCC: write rows, restart with same key, verify recovery replays them.
+/// Then swap to a wrong key and verify that restart fails.
+#[test]
+fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    write_synthetic_row(&db, "encrypted_value");
+
+    // --- Verify the raw log file is encrypted (no plaintext leakage) ---
+    {
+        let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+        let log_bytes = std::fs::read(&log_path).expect("MVCC log file should exist");
+        assert!(
+            log_bytes.len() > 56,
+            "MVCC log should contain data beyond the header"
+        );
+        let plaintext = b"encrypted_value";
+        assert!(
+            !log_bytes.windows(plaintext.len()).any(|w| w == plaintext),
+            "MVCC log must not contain plaintext data when encryption is enabled"
+        );
+    }
+
+    // --- Restart with correct key: recovery should replay the encrypted log ---
+    db.restart();
+    {
+        let conn = db.connect();
+        let mvcc_store = db.get_mvcc_store();
+        let max_root_page = get_rows(
+            &conn,
+            "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        let synthetic_table_id = MVTableId::new(-(max_root_page + 100));
+        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+        let row = mvcc_store
+            .read(tx_id, &RowID::new(synthetic_table_id, RowKey::Int(1)))
+            .unwrap()
+            .unwrap();
+        let record = get_record_value(&row);
+        match record.get_value(0).unwrap() {
+            ValueRef::Text(text) => assert_eq!(text.as_str(), "encrypted_value"),
+            other => panic!("Expected Text, got {other:?}"),
+        }
+        conn.close().unwrap();
+    }
+
+    // --- Restart with wrong key: should fail ---
+    let wrong_key = "ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    db.enc_opts = Some(crate::EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: wrong_key.to_string(),
+    });
+    assert!(
+        db.restart_result().is_err(),
+        "Expected error when reopening encrypted MVCC DB with wrong key"
+    );
+}
+
+/// Enabling MVCC on a file-backed database must still bootstrap durable MVCC
+/// metadata even if encryption has only been opted-in and no key/cipher exists yet.
+#[test]
+fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("test.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let db = Database::open_file_with_flags(
+        io,
+        path.as_os_str().to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    // Reproduce the deferred-key flow: encryption is enabled as a feature, but
+    // the session has not configured any key/cipher when MVCC bootstrap runs.
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    let metadata_root = metadata_root_page(&conn);
+    assert!(
+        metadata_root > 0,
+        "metadata table must be present after enabling MVCC on a file-backed db",
+    );
+
+    let meta = get_rows(
+        &conn,
+        "SELECT k, v FROM __turso_internal_mvcc_meta ORDER BY rowid",
+    );
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0][0].to_string(), "persistent_tx_ts_max");
+    assert_eq!(meta[0][1].as_int().unwrap(), 0);
+}
+
+/// Reopening an encrypted MVCC database without any key material must fail before
+/// logical-log recovery, even if there is an outstanding MVCC log tail on disk.
+#[test]
+fn test_mvcc_encrypted_restart_without_key_fails_before_recovery() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'secret')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let log_bytes = std::fs::read(&log_path).expect("db-log should exist after MVCC writes");
+    assert!(
+        log_bytes.len() > LOG_HDR_SIZE,
+        "db-log should contain at least one frame before restart"
+    );
+
+    db.enc_opts = None;
+    assert!(
+        matches!(db.restart_result(), Err(LimboError::NotADB)),
+        "reopening an encrypted MVCC database without a key must fail during db open, before recovery",
+    );
+}
+
+#[test]
+fn test_encrypted_recovery_large_payload_multi_chunk() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let large_value = "x".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute(format!("INSERT INTO t VALUES (1, '{large_value}')"))
+            .unwrap();
+    }
+
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+    assert!(log_path.exists(), "db-log should exist before restart");
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT id, length(v), substr(v, 1, 16), substr(v, length(v) - 15, 16) FROM t",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), large_value.len() as i64);
+    assert_eq!(rows[0][2].to_string(), "xxxxxxxxxxxxxxxx");
+    assert_eq!(rows[0][3].to_string(), "xxxxxxxxxxxxxxxx");
+}
+
+#[test]
+fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let large_value = "z".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'survives')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute(format!("INSERT INTO t VALUES (2, '{large_value}')"))
+            .unwrap();
+    }
+
+    let mut log_bytes = std::fs::read(&log_path).expect("db-log should exist");
+    let payload_size = u64::from_le_bytes(
+        log_bytes[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let chunk_count = payload_size.div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+    assert!(
+        chunk_count >= 3,
+        "expected multi-chunk encrypted recovery tail"
+    );
+
+    let enc_ctx = crate::storage::encryption::EncryptionContext::new(
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+        &EncryptionKey::from_hex_string(hex_key).unwrap(),
+        4096,
+    )
+    .unwrap();
+    let first_chunk_on_disk_size =
+        ENCRYPTED_PAYLOAD_CHUNK_SIZE + enc_ctx.tag_size() + enc_ctx.nonce_size();
+    let corrupt_offset = LOG_HDR_SIZE + TX_HEADER_SIZE + first_chunk_on_disk_size + 1;
+    log_bytes[corrupt_offset] ^= 0xFF;
+    std::fs::write(&log_path, &log_bytes).unwrap();
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "survives");
+}
+
+/// Read the raw db-log file and verify every TX frame payload can be decrypted.
+/// Panics if the file is missing, has no frames, or any payload fails to decrypt.
+fn assert_log_payloads_decrypt(
+    log_path: &std::path::Path,
+    hex_key: &str,
+    cipher: crate::storage::encryption::CipherMode,
+) {
+    use crate::storage::encryption::EncryptionContext;
+
+    let log_bytes = std::fs::read(log_path).expect("db-log file should exist");
+    assert!(
+        log_bytes.len() > LOG_HDR_SIZE,
+        "db-log should contain data beyond the header"
+    );
+
+    let key = EncryptionKey::from_hex_string(hex_key).unwrap();
+    let enc_ctx = EncryptionContext::new(cipher, &key, 4096).unwrap();
+    let nonce_size = enc_ctx.nonce_size();
+    let tag_size = enc_ctx.tag_size();
+
+    // Parse salt from log header (bytes 8..16, little-endian u64)
+    let salt = u64::from_le_bytes(log_bytes[8..16].try_into().unwrap());
+
+    let mut offset = LOG_HDR_SIZE;
+    let mut frame_count = 0;
+
+    while offset + TX_HEADER_SIZE + TX_TRAILER_SIZE <= log_bytes.len() {
+        // TX Header: frame_magic(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        let frame_magic = u32::from_le_bytes(log_bytes[offset..offset + 4].try_into().unwrap());
+        if frame_magic != FRAME_MAGIC {
+            break; // not a valid frame
+        }
+        let payload_size =
+            u64::from_le_bytes(log_bytes[offset + 4..offset + 12].try_into().unwrap()) as usize;
+        let op_count = u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
+        let commit_ts = u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
+
+        let mut payload_offset = offset + TX_HEADER_SIZE;
+        let chunk_count = if payload_size == 0 {
+            0
+        } else {
+            payload_size.div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+        };
+
+        let mut frame_complete = true;
+        for chunk_index in 0..chunk_count {
+            let chunk_plaintext_len = (payload_size - chunk_index * ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+                .min(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+            let chunk_on_disk_size = chunk_plaintext_len + tag_size + nonce_size;
+            if payload_offset + chunk_on_disk_size + TX_TRAILER_SIZE > log_bytes.len() {
+                frame_complete = false;
+                break;
+            }
+
+            let blob = &log_bytes[payload_offset..payload_offset + chunk_on_disk_size];
+            let ciphertext = &blob[..chunk_plaintext_len + tag_size];
+            let nonce = &blob[chunk_plaintext_len + tag_size..];
+
+            let mut aad = [0u8; 32];
+            aad[..8].copy_from_slice(&salt.to_le_bytes());
+            if chunk_index + 1 == chunk_count {
+                aad[8..16].copy_from_slice(&(payload_size as u64).to_le_bytes());
+            }
+            aad[16..20].copy_from_slice(&op_count.to_le_bytes());
+            aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
+            aad[28..32].copy_from_slice(&(chunk_index as u32).to_le_bytes());
+
+            enc_ctx
+                .decrypt_chunk(ciphertext, nonce, &aad)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to decrypt frame {frame_count} chunk {chunk_index} at offset {offset}: {e}"
+                    )
+                });
+
+            payload_offset += chunk_on_disk_size;
+        }
+        if !frame_complete {
+            break;
+        }
+
+        frame_count += 1;
+        offset = payload_offset + TX_TRAILER_SIZE; // skip trailer
+    }
+
+    assert!(
+        frame_count > 0,
+        "db-log should contain at least one TX frame"
+    );
+}
+
+/// Encrypted version of test_recovery_checkpoint_then_more_writes.
+/// Checkpoint some rows, write more without checkpointing, restart, verify all rows survive.
+#[test]
+fn test_encrypted_recovery_checkpoint_then_more_writes() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+    }
+
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+    assert!(log_path.exists(), "db-log file should exist before restart");
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "b");
+    assert_eq!(rows[2][0].as_int().unwrap(), 3);
+    assert_eq!(rows[2][1].to_string(), "c");
+}
+
+/// Write, restart, write more, restart again, verify all data accumulates correctly.
+#[test]
+fn test_encrypted_recovery_multiple_restart_cycles() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    // Cycle 1: create table + insert
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+    }
+
+    assert!(log_path.exists(), "db-log file should exist after cycle 1");
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
+    db.restart();
+
+    // Cycle 2: insert more rows
+    {
+        let conn = db.connect();
+        conn.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'third')").unwrap();
+    }
+
+    db.restart();
+
+    // Verify all rows survived two restart cycles
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1].to_string(), "first");
+    assert_eq!(rows[1][1].to_string(), "second");
+    assert_eq!(rows[2][1].to_string(), "third");
+}
+
+/// Corrupt ciphertext bytes in the encrypted log payload. Recovery should treat the
+/// corrupted frame as a torn tail and stop cleanly without losing earlier valid frames.
+#[test]
+fn test_encrypted_recovery_corrupted_ciphertext() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+
+    // Write two transactions: checkpoint the first, leave the second only in the log.
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'survives')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'corrupted')")
+            .unwrap();
+    }
+
+    assert!(
+        log_path.exists(),
+        "db-log file should exist before corruption"
+    );
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
+
+    // Corrupt the payload of the second (non-checkpointed) frame in the log file.
+    // The log header is 56 bytes, then the TX header is 24 bytes. Flip a byte
+    // in the encrypted payload area right after that.
+    {
+        let mut log_bytes = std::fs::read(&log_path).expect("log file should exist");
+        assert!(
+            log_bytes.len() > 56 + 24 + 1,
+            "log should have data beyond header + tx header"
+        );
+        // Flip a byte in the encrypted payload region
+        let corrupt_offset = 56 + 24 + 1;
+        log_bytes[corrupt_offset] ^= 0xFF;
+        std::fs::write(&log_path, &log_bytes).unwrap();
+    }
+
+    // Restart: recovery should discard the corrupted frame but the checkpointed
+    // row (id=1) must survive because it's already in the DB file.
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "survives");
 }

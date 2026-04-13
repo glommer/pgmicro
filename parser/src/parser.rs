@@ -186,7 +186,7 @@ impl<'a> Parser<'a> {
             self.last_variable_id += 1;
             let index = NonZeroU32::new(self.last_variable_id).unwrap();
             Ok(Expr::Variable(Variable::indexed(index)))
-        } else if matches!(token[0], b':' | b'@' | b'$' | b'#') {
+        } else if matches!(token[0], b':' | b'@' | b'$') {
             let index = if let Some(index) = self.named_variables.get(token).copied() {
                 index
             } else {
@@ -681,26 +681,19 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a bracket-quoted identifier like `[name]` or `[ multi word name]`.
-    /// Captures the raw bytes between `[` and `]` so whitespace is preserved
-    /// verbatim (the lexer discards inter-token whitespace, so we can't
-    /// reassemble from tokens without losing e.g. leading spaces).
     fn parse_bracket_quoted_name(&mut self) -> Result<Name> {
         eat_assert!(self, TK_LBRACKET);
-        // Byte offset right after the `[` token
         let start = self.lexer.offset;
-        loop {
-            let tok = match self.eat()? {
-                Some(t) => t,
-                None => return Err(Error::ParseUnexpectedEOF),
-            };
-            if tok.token_type == TK_RBRACKET {
-                // tok.value points to `]`; its start is the end of our content
-                let end = tok.value.as_ptr() as usize - self.lexer.input.as_ptr() as usize;
-                let raw = &self.lexer.input[start..end];
-                let name = String::from_utf8_lossy(raw).into_owned();
-                return Ok(Name::exact(name));
-            }
-        }
+        let rest = &self.lexer.input[start..];
+        let end_pos = rest
+            .iter()
+            .position(|&b| b == b']')
+            .ok_or(Error::ParseUnexpectedEOF)?;
+        let raw = &self.lexer.input[start..start + end_pos];
+        let name = String::from_utf8_lossy(raw).into_owned();
+        // Advance lexer past the closing `]`
+        self.lexer.offset = start + end_pos + 1;
+        Ok(Name::exact(name))
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
@@ -2669,8 +2662,24 @@ impl<'a> Parser<'a> {
                     }
                 }
 
+                let expr_start = self.offset();
                 let expr = self.parse_expr(0)?;
+                let expr_end = self.offset();
                 let alias = self.parse_as()?;
+                // When there is no explicit AS alias, use the original SQL
+                // text of the expression as an implicit column name. This
+                // matches SQLite's behavior of preserving the verbatim
+                // expression text as the column name.
+                let alias = alias.or_else(|| {
+                    let text = std::str::from_utf8(&self.lexer.input[expr_start..expr_end])
+                        .ok()?
+                        .trim();
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(As::ImplicitColumnName(Name::exact(text.to_string())))
+                    }
+                });
                 Ok(ResultColumn::Expr(expr, alias))
             }
         }
@@ -12208,15 +12217,20 @@ mod tests {
                 results.push(cmd.unwrap());
             }
 
-            assert_eq!(results, expected, "Input: {input_str:?}");
+            // Compare serialized forms since ImplicitColumnName (display-only
+            // metadata) serializes to nothing, making comparison insensitive
+            // to its presence.
+            let results_str: Vec<String> = results.iter().map(|c| c.to_string()).collect();
+            let expected_str: Vec<String> = expected.iter().map(|c| c.to_string()).collect();
+            assert_eq!(results_str, expected_str, "Input: {input_str:?}");
 
-            // to_string tests
+            // to_string round-trip tests
             for (i, r) in results.iter().enumerate() {
                 let rstring = r.to_string();
                 // put new string into parser again
                 let result = Parser::new(rstring.as_bytes()).next().unwrap().unwrap();
-                let expected = &expected[i];
-                assert_eq!(result, expected.clone(), "Input: {rstring:?}");
+                let result_str = result.to_string();
+                assert_eq!(result_str, expected_str[i], "Input: {rstring:?}");
             }
         }
     }

@@ -127,6 +127,12 @@ impl PostgreSQLTranslator {
 
         let tbl_name = self.qualified_name_from_range_var(relation);
 
+        if create.table_elts.is_empty() {
+            return Err(ParseError::ParseError(
+                "CREATE TABLE with no columns is not yet supported".into(),
+            ));
+        }
+
         let mut columns = Vec::new();
         let mut table_constraints = Vec::new();
         let mut has_autoincrement = false;
@@ -1126,7 +1132,9 @@ impl PostgreSQLTranslator {
 
         let target_list = &select.target_list;
         if target_list.is_empty() {
-            return Err(ParseError::ParseError("Empty target list".to_string()));
+            return Err(ParseError::ParseError(
+                "SELECT requires at least one column or expression".to_string(),
+            ));
         }
 
         let result_columns = self.translate_target_list(target_list)?;
@@ -1269,7 +1277,9 @@ impl PostgreSQLTranslator {
 
         let target_list = &select.target_list;
         if target_list.is_empty() {
-            return Err(ParseError::ParseError("Empty target list".to_string()));
+            return Err(ParseError::ParseError(
+                "SELECT requires at least one column or expression".to_string(),
+            ));
         }
 
         let result_columns = self.translate_target_list(target_list)?;
@@ -5405,7 +5415,7 @@ mod tests {
             if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
                 let wc = where_clause.as_ref().expect("Expected WHERE clause");
                 if let ast::Expr::FunctionCall { name, args, .. } = &**wc {
-                    assert_eq!(name.as_str(), "pg_array_contains");
+                    assert_eq!(name.as_str(), "array_contains_all");
                     assert_eq!(args.len(), 2);
                 } else {
                     panic!("Expected FunctionCall for @>, got: {wc:?}");
@@ -5428,7 +5438,7 @@ mod tests {
             if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
                 let wc = where_clause.as_ref().expect("Expected WHERE clause");
                 if let ast::Expr::FunctionCall { name, .. } = &**wc {
-                    assert_eq!(name.as_str(), "pg_array_contained");
+                    assert_eq!(name.as_str(), "array_contains_all");
                 } else {
                     panic!("Expected FunctionCall for <@, got: {wc:?}");
                 }
@@ -5450,7 +5460,7 @@ mod tests {
             if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
                 let wc = where_clause.as_ref().expect("Expected WHERE clause");
                 if let ast::Expr::FunctionCall { name, .. } = &**wc {
-                    assert_eq!(name.as_str(), "pg_array_overlaps");
+                    assert_eq!(name.as_str(), "array_overlap");
                 } else {
                     panic!("Expected FunctionCall for &&, got: {wc:?}");
                 }

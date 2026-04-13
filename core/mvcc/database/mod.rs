@@ -1,5 +1,8 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
+use crate::mvcc::yield_points::inject_transition_yield;
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -42,6 +45,8 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
+#[cfg(any(test, injected_yields))]
+use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
 
@@ -892,9 +897,47 @@ impl CommitCoordinator {
     }
 }
 
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[repr(u8)]
+enum CommitYieldPoint {
+    CommitValidation,
+    WaitForDependencies,
+    LogRecordPrepared,
+}
+
+#[cfg(any(test, injected_yields))]
+impl YieldPointMarker for CommitYieldPoint {
+    const POINT_COUNT: u8 = Self::COUNT as u8;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
+}
+
+#[cfg(any(test, injected_yields))]
+fn commit_yield_key(tx_id: u64) -> u64 {
+    // any large number will do
+    const COMMIT_SELECTION_TAG: u64 = 0xC011_C011_C011_C011;
+    tx_id ^ COMMIT_SELECTION_TAG
+}
+
+#[cfg(any(test, injected_yields))]
+impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
+    fn yield_context(&self) -> YieldContext {
+        YieldContext::new(
+            self.connection.yield_injector(),
+            self.yield_instance_id,
+            commit_yield_key(self.tx_id),
+        )
+    }
+}
+
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState<Clock>,
     is_finalized: bool,
+    #[cfg(any(test, injected_yields))]
+    yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
     connection: Arc<Connection>,
@@ -958,6 +1001,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Self {
             state,
             is_finalized: false,
+            #[cfg(any(test, injected_yields))]
+            yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: false,
             tx_id,
             connection,
@@ -1233,31 +1278,38 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             log_record.header = Some(*tx.header.read());
         }
 
-        for id in &self.write_set {
+        // Process schema rows (sqlite_schema) before data rows so that during log
+        // replay the table_id_to_rootpage map is populated before data row inserts
+        // reference it. The SkipSet iteration order sorts by table_id (most negative
+        // first), which would otherwise place data table rows (e.g. table_id=-3)
+        // before schema rows (table_id=-1).
+        let collect_versions = |id: &RowID,
+                                log_record: &mut LogRecord,
+                                did_commit_schema: &mut bool| {
             if let Some(row_versions) = mvcc_store.rows.get(id) {
                 let row_versions = row_versions.value().read();
                 for row_version in row_versions.iter() {
                     let mut committed_version = row_version.clone();
                     let mut changed = false;
-                    if let Some(TxTimestampOrID::TxID(id)) = committed_version.begin {
-                        if id == self.tx_id {
+                    if let Some(TxTimestampOrID::TxID(vid)) = committed_version.begin {
+                        if vid == self.tx_id {
                             // New version is valid STARTING FROM the committing
                             // transaction's end timestamp. See Hekaton page 299.
                             committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                             changed = true;
                             if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                self.did_commit_schema_change = true;
+                                *did_commit_schema = true;
                             }
                         }
                     }
-                    if let Some(TxTimestampOrID::TxID(id)) = committed_version.end {
-                        if id == self.tx_id {
+                    if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
+                        if vid == self.tx_id {
                             // Old version is valid UNTIL the committing
                             // transaction's end timestamp. See Hekaton page 299.
                             committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                             changed = true;
                             if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                self.did_commit_schema_change = true;
+                                *did_commit_schema = true;
                             }
                         }
                     }
@@ -1278,16 +1330,16 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     for row_version in row_versions.iter() {
                         let mut committed_version = row_version.clone();
                         let mut changed = false;
-                        if let Some(TxTimestampOrID::TxID(id)) = committed_version.begin {
-                            if id == self.tx_id {
+                        if let Some(TxTimestampOrID::TxID(vid)) = committed_version.begin {
+                            if vid == self.tx_id {
                                 // New version is valid STARTING FROM the committing
                                 // transaction's end timestamp. See Hekaton page 299.
                                 committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                                 changed = true;
                             }
                         }
-                        if let Some(TxTimestampOrID::TxID(id)) = committed_version.end {
-                            if id == self.tx_id {
+                        if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
+                            if vid == self.tx_id {
                                 // Old version is valid UNTIL the committing
                                 // transaction's end timestamp. See Hekaton page 299.
                                 committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
@@ -1302,6 +1354,19 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         }
                     }
                 }
+            }
+        };
+
+        // First pass: schema rows only
+        for id in &self.write_set {
+            if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                collect_versions(id, &mut log_record, &mut self.did_commit_schema_change);
+            }
+        }
+        // Second pass: all non-schema rows
+        for id in &self.write_set {
+            if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                collect_versions(id, &mut log_record, &mut self.did_commit_schema_change);
             }
         }
 
@@ -1567,6 +1632,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
                 self.state = CommitState::Commit { end_ts };
+                inject_transition_yield!(self, CommitYieldPoint::CommitValidation);
                 Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
@@ -1596,6 +1662,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // TxID references until CommitEnd so an abandoned commit can
                 // still be rolled back by matching on TxID(self.tx_id).
                 self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
+                inject_transition_yield!(self, CommitYieldPoint::WaitForDependencies);
                 return Ok(TransitionResult::Continue);
             }
             CommitState::WaitForDependencies { end_ts } => {
@@ -1665,6 +1732,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 } else {
                     self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
                 }
+                inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
@@ -1837,7 +1905,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                     Err(err) => {
                         // Auto-checkpoint errors should not surface to the committed statement.
-                        tracing::debug!("MVCC auto-checkpoint failed: {err}");
+                        tracing::info!("MVCC auto-checkpoint failed: {err}");
                         self.finalize(mvcc_store)?;
                         return Ok(TransitionResult::Done(()));
                     }
@@ -2343,41 +2411,38 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 None => {
                     let log_size = self.get_logical_log_file().size()?;
                     let pager = bootstrap_conn.pager.load().clone();
-                    if !pager.is_encryption_enabled() {
-                        if bootstrap_conn.db.is_readonly() {
-                            return Err(LimboError::Corrupt(
-                                "Missing MVCC metadata table in read-only mode".to_string(),
-                            ));
-                        }
-                        if log_size > LOG_HDR_SIZE as u64 {
-                            return Err(LimboError::Corrupt(
-                                "Missing MVCC metadata table while logical log state exists"
-                                    .to_string(),
-                            ));
-                        }
-                        // First-time MVCC bootstrap: ensure a durable logical-log header exists
-                        // before any metadata-table writes can commit into WAL.
-                        // If a previous crash left a torn header tail (0 < size < LOG_HDR_SIZE),
-                        // clear it before rewriting the header.
-                        if log_size > 0 && log_size < LOG_HDR_SIZE as u64 {
-                            let log_file = self.get_logical_log_file();
-                            let c = log_file.truncate(0, Completion::new_trunc(|_| {}))?;
-                            bootstrap_conn.db.io.wait_for_completion(c)?;
-                        }
-                        if log_size <= LOG_HDR_SIZE as u64 {
-                            let pager = bootstrap_conn.pager.load().clone();
-                            let c = self.storage.update_header()?;
-                            pager.io.wait_for_completion(c)?;
-                            if bootstrap_conn.get_sync_mode() != SyncMode::Off {
-                                let c = self.storage.sync(pager.get_sync_type())?;
-                                pager.io.wait_for_completion(c)?;
-                            }
-                        }
-                        self.initialize_mvcc_metadata_table(&bootstrap_conn)?;
-                        // Metadata bootstrap writes land in SQLite WAL first; reconcile immediately so
-                        // subsequent opens (including read-only opens) do not depend on WAL replay.
-                        self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
+                    if bootstrap_conn.db.is_readonly() {
+                        return Err(LimboError::Corrupt(
+                            "Missing MVCC metadata table in read-only mode".to_string(),
+                        ));
                     }
+                    if log_size > LOG_HDR_SIZE as u64 {
+                        return Err(LimboError::Corrupt(
+                            "Missing MVCC metadata table while logical log state exists"
+                                .to_string(),
+                        ));
+                    }
+                    // First-time MVCC bootstrap: ensure a durable logical-log header exists
+                    // before any metadata-table writes can commit into WAL.
+                    // If a previous crash left a torn header tail (0 < size < LOG_HDR_SIZE),
+                    // clear it before rewriting the header.
+                    if log_size > 0 && log_size < LOG_HDR_SIZE as u64 {
+                        let log_file = self.get_logical_log_file();
+                        let c = log_file.truncate(0, Completion::new_trunc(|_| {}))?;
+                        bootstrap_conn.db.io.wait_for_completion(c)?;
+                    }
+                    if log_size <= LOG_HDR_SIZE as u64 {
+                        let c = self.storage.update_header()?;
+                        pager.io.wait_for_completion(c)?;
+                        if bootstrap_conn.get_sync_mode() != SyncMode::Off {
+                            let c = self.storage.sync(pager.get_sync_type())?;
+                            pager.io.wait_for_completion(c)?;
+                        }
+                    }
+                    self.initialize_mvcc_metadata_table(&bootstrap_conn)?;
+                    // Metadata bootstrap writes land in SQLite WAL first; reconcile immediately so
+                    // subsequent opens (including read-only opens) do not depend on WAL replay.
+                    self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
                 }
             }
         }
@@ -4208,6 +4273,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
         let file = self.get_logical_log_file();
+        // Header is never encrypted; no need to pass EncryptionContext here.
         let mut reader = StreamingLogicalLogReader::new(file, None);
         match reader.try_read_header(&pager.io)? {
             HeaderReadResult::Valid(_) => Ok(true),
@@ -4234,6 +4300,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let wal_max_frame = wal.get_max_frame_in_wal();
         let file = self.get_logical_log_file();
+        // This method only reads the header (never encrypted); no need to pass EncryptionContext.
         let mut reader = StreamingLogicalLogReader::new(file, None);
         let header_result = reader.try_read_header(&pager.io)?;
 
@@ -4337,7 +4404,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
         let pager = connection.pager.load().clone();
         let file = self.get_logical_log_file();
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let enc_ctx = self.storage.encryption_ctx();
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), enc_ctx);
         let preserved_table_valued_functions =
             Self::capture_table_valued_functions(&connection.schema.read());
 
@@ -4357,7 +4425,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let persistent_tx_ts_max = if self.uses_durable_mvcc_metadata(&connection) {
             match self.try_read_persistent_tx_ts_max(&connection)? {
                 Some(ts) => ts,
-                None if pager.is_encryption_enabled() => 0,
                 None if header.is_none() => 0,
                 None => {
                     return Err(LimboError::Corrupt(
@@ -4623,12 +4690,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let rowid_int = rowid.row_id.to_int_or_panic();
                         schema_rows.insert(rowid_int, record);
                         needs_schema_rebuild.set(true);
-                    } else {
-                        turso_assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
-                        "Logical log contains a row version insert with a table id that does not exist in the table_id_to_rootpage map",
-                        {"table_id": rowid.table_id,
-                            "table_id_to_rootpage_map": format!("{:?}", self.table_id_to_rootpage.iter().collect::<Vec<_>>())
-                        });
+                    } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
+                        // Data row references a table_id not yet in the map. This can happen
+                        // with logs written before the schema-first serialization fix: in a
+                        // same-transaction CREATE TABLE + INSERT + DROP TABLE, data rows were
+                        // serialized before the schema INSERT that registers the table_id.
+                        // The schema INSERT (or DELETE) for this table will follow later in
+                        // this transaction frame, so we register the table_id now.
+                        self.insert_table_id_to_rootpage(rowid.table_id, None);
                     }
 
                     let version_id = self.get_version_id();
@@ -4658,9 +4727,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     if commit_ts <= replay_cutoff_ts {
                         continue;
                     }
-                    turso_assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
-                        "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map",
-                        {"rootpage_map": rowid.table_id});
+                    if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
+                        // See comment in UpsertTableRow: old logs may have data rows
+                        // serialized before the schema INSERT that registers the table_id.
+                        self.insert_table_id_to_rootpage(rowid.table_id, None);
+                    }
                     if let Some(versions) = self.rows.get(&rowid) {
                         // Row exists in memory — try to find the current (non-ended) version
                         // that was committed before this delete, and mark it as ended. If no
@@ -4702,11 +4773,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                     if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                         let rowid_int = rowid.row_id.to_int_or_panic();
-                        let record = schema_rows.get(&rowid_int).ok_or_else(|| {
-                            LimboError::Corrupt(format!(
-                                "Logical log deletes sqlite_schema rowid {rowid_int} that does not exist in merged schema state"
-                            ))
-                        })?;
+                        let Some(record) = schema_rows.get(&rowid_int) else {
+                            // this can happen if a row in sqlite_schema was inserted and then
+                            // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
+                            continue;
+                        };
                         if record.column_count() < 5 {
                             return Err(LimboError::Corrupt(format!(
                                 "sqlite_schema row must have at least 5 columns, got {}",

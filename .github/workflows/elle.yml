@@ -1,12 +1,6 @@
 name: Elle Consistency Check
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       max_steps:
@@ -17,9 +11,12 @@ on:
         description: "Random seed (leave empty for random)"
         required: false
         default: ""
-  schedule:
-    # Run nightly at 3am UTC
-    - cron: "0 3 * * *"
+  push:
+    branches:
+      - turso-only
+  pull_request:
+    branches:
+      - turso-only
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}

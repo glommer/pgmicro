@@ -1,4 +1,4 @@
-use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
+use crate::{turso_assert, turso_assert_eq, turso_debug_assert, MAIN_DB_ID};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
@@ -235,6 +235,10 @@ pub struct ProgramBuilder {
     /// This flag is used in combination with is_multi_write to determine if statement subjournaling is required.
     /// Defaults to true for safety; specific translate paths (e.g., INSERT with no constraints) set false.
     may_abort: bool,
+    /// True until the builder emits an opcode that may directly modify persistent
+    /// database contents, mirroring sqlite3_stmt_readonly() classification over
+    /// compiled bytecode.
+    readonly: bool,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
@@ -515,6 +519,7 @@ impl ProgramBuilder {
             reg_result_cols_start: None,
             is_multi_write: true,
             may_abort: true,
+            readonly: true,
             trigger,
             is_subprogram,
             resolve_type: ResolveType::Abort,
@@ -849,6 +854,7 @@ impl ProgramBuilder {
         self.result_columns.push(ResultSetColumn {
             expr,
             alias: Some(col_name),
+            implicit_column_name: None,
             contains_aggregates: false,
         });
     }
@@ -857,6 +863,7 @@ impl ProgramBuilder {
     pub fn emit_insn(&mut self, insn: Insn) {
         // This seemingly empty trace here is needed so that a function span is emmited with it
         tracing::trace!("");
+        self.readonly &= insn.is_readonly();
         self.insns.push((insn, self.insns.len()));
     }
 
@@ -1480,7 +1487,7 @@ impl ProgramBuilder {
     /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
     pub fn begin_write_operation(&mut self) {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.insert(0);
+        self.write_databases.insert(MAIN_DB_ID);
     }
 
     /// Begin a write operation on a specific database (for attached databases).
@@ -1771,6 +1778,7 @@ impl ProgramBuilder {
             comments: self.comments,
             parameters: self.parameters,
             change_cnt_on,
+            readonly: self.readonly,
             result_columns: self.result_columns,
             table_references: self.table_references,
             sql: sql.to_string(),

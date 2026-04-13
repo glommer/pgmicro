@@ -151,7 +151,7 @@ use turso_parser::{
     parser::Parser,
 };
 
-const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
+pub const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
@@ -165,7 +165,7 @@ fn quote_ident(name: &str) -> String {
     let needs_quoting = name.is_empty()
         || name.as_bytes()[0].is_ascii_digit()
         || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        || turso_parser::lexer::is_keyword(name.as_bytes());
+        || turso_parser::lexer::is_quotable_keyword(name.as_bytes());
     if needs_quoting {
         let escaped = name.replace('"', "\"\"");
         format!("\"{escaped}\"")
@@ -741,7 +741,8 @@ impl Schema {
     }
 
     pub fn add_trigger(&mut self, trigger: Trigger, table_name: &str) -> Result<()> {
-        self.check_object_name_conflict(&trigger.name)?;
+        // Triggers have their own namespace and duplicate trigger names
+        // are checked in `translate_create_trigger`
         let table_name = normalize_ident(table_name);
 
         // See [Schema::add_index] for why we push to the front of the deque.
@@ -2365,15 +2366,8 @@ impl BTreeTable {
                 sql.push_str(", ");
             }
 
-            // we need to wrap the column name in square brackets if it contains special characters
             let column_name = column.name.as_ref().expect("column name is None");
-            if identifier_contains_special_chars(column_name) {
-                sql.push('[');
-                sql.push_str(column_name);
-                sql.push(']');
-            } else {
-                sql.push_str(column_name);
-            }
+            sql.push_str(&quote_ident(column_name));
 
             if !column.ty_str.is_empty() {
                 sql.push(' ');
@@ -2510,13 +2504,7 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                if identifier_contains_special_chars(col_name) {
-                    sql.push('[');
-                    sql.push_str(col_name);
-                    sql.push(']');
-                } else {
-                    sql.push_str(col_name);
-                }
+                sql.push_str(&quote_ident(col_name));
             }
             sql.push(')');
         }
@@ -2554,10 +2542,58 @@ impl BTreeTable {
         }
         map
     }
-}
 
-fn identifier_contains_special_chars(name: &str) -> bool {
-    name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_')
+    pub fn prepare_generated_columns(&mut self) -> Result<()> {
+        self.has_virtual_columns = self.columns.iter().any(|c| c.is_virtual_generated());
+        if !self.has_virtual_columns {
+            return Ok(());
+        }
+        for i in 0..self.columns.len() {
+            if self.columns[i].is_virtual_generated() {
+                let mut expr = self.columns[i].generated_expr().cloned().unwrap();
+                resolve_gencol_expr_columns(&mut expr, &self.columns)?;
+                *self.columns[i].generated_expr_mut().unwrap() = expr;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn shift_generated_column_indices_after_drop(
+        &mut self,
+        dropped_index: usize,
+    ) -> Result<()> {
+        if !self.has_virtual_columns {
+            return Ok(());
+        }
+
+        for column in &mut self.columns {
+            let Some(expr) = column.generated_expr_mut() else {
+                continue;
+            };
+
+            walk_expr_mut(expr, &mut |e| match e {
+                Expr::Column {
+                    table,
+                    column,
+                    is_rowid_alias: _,
+                    ..
+                } if table.is_self_table() => {
+                    if *column == dropped_index {
+                        return Err(LimboError::InternalError(
+                            "dropped column remained referenced by generated column".to_string(),
+                        ));
+                    }
+                    if *column > dropped_index {
+                        *column -= 1;
+                    }
+                    Ok(WalkControl::Continue)
+                }
+                _ => Ok(WalkControl::Continue),
+            })?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -2813,7 +2849,7 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
     Ok(())
 }
 
-fn validate_generated_expr(expr: &Expr) -> Result<()> {
+pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
     use ast::Expr;
     match expr {
         Expr::Qualified(_, _) => {
@@ -3426,19 +3462,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
-    // Pre-resolve generated column names to Expr::Column { table: SELF_TABLE, ... }
-    let mut has_virtual_columns = false;
-    for i in 0..cols.len() {
-        if cols[i].is_virtual_generated() {
-            has_virtual_columns = true;
-            let mut expr = cols[i].generated_expr().cloned().unwrap();
-            resolve_gencol_expr_columns(&mut expr, &cols)?;
-            *cols[i].generated_expr_mut().unwrap() = expr;
-        }
-    }
-
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols);
-    Ok(BTreeTable {
+    let mut table = BTreeTable {
         root_page,
         name: table_name,
         has_rowid,
@@ -3490,9 +3514,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         },
         check_constraints,
         rowid_alias_conflict_clause,
-        has_virtual_columns,
-        logical_to_physical_map,
-    })
+        has_virtual_columns: false,
+        logical_to_physical_map: Vec::new(),
+    };
+    table.prepare_generated_columns()?;
+    table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&table.columns);
+    Ok(table)
 }
 
 /// SQLite treats bare identifiers in DEFAULT clauses as string literals.
@@ -3594,9 +3621,8 @@ impl ResolvedFkRef {
             // Without a rowid alias, a direct rowid update is represented separately with ROWID_SENTINEL
             return true;
         }
-        self.parent_pos
-            .iter()
-            .any(|p| updated_parent_positions.contains(p))
+        let affected = columns_affected_by_update(&parent_tbl.columns, updated_parent_positions);
+        self.parent_pos.iter().any(|p| affected.contains(p))
     }
 
     /// Returns if any child column of this FK is in `updated_child_positions`
@@ -4763,14 +4789,14 @@ mod tests {
     pub fn test_special_column_names() -> Result<()> {
         let tests = [
             ("foobar", "CREATE TABLE t (foobar TEXT)"),
-            ("_table_name3", "CREATE TABLE t (_table_name3 TEXT)"),
-            ("special name", "CREATE TABLE t ([special name] TEXT)"),
-            ("foo&bar", "CREATE TABLE t ([foo&bar] TEXT)"),
-            (" name", "CREATE TABLE t ([ name] TEXT)"),
+            ("_table_name3", r#"CREATE TABLE t (_table_name3 TEXT)"#),
+            ("special name", r#"CREATE TABLE t ("special name" TEXT)"#),
+            ("foo&bar", r#"CREATE TABLE t ("foo&bar" TEXT)"#),
+            (" name", r#"CREATE TABLE t (" name" TEXT)"#),
         ];
 
         for (input_column_name, expected_sql) in tests {
-            let sql = format!("CREATE TABLE t ([{input_column_name}] TEXT)");
+            let sql = format!(r#"CREATE TABLE t ("{input_column_name}" TEXT)"#);
             let actual = BTreeTable::from_sql(&sql, 0)?.to_sql();
             assert_eq!(expected_sql, actual);
         }

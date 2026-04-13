@@ -1,4 +1,7 @@
 use crate::error::io_error;
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_points::YieldInjector;
+use crate::statement::StatementOrigin;
 use crate::storage::journal_mode;
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
@@ -11,11 +14,12 @@ use crate::types::{WalFrameInfo, WalState};
 use crate::util::{OpenMode, OpenOptions};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
-use crate::MAIN_DB_ID;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
-    parse_schema_rows, refresh_analyze_stats, translate,
+    is_attached_db, parse_schema_rows,
+    progress::{ProgressHandler, ProgressHandlerCallback},
+    refresh_analyze_stats, translate,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSqlDialect, AtomicSyncMode, AtomicTempStore,
     BusyHandler, BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult,
@@ -24,6 +28,7 @@ use crate::{
     Pager, Parser, QueryMode, QueryRunner, Result, Schema, SqlDialect, Statement, SyncMode,
     TransactionMode, Trigger, Value, VirtualTable,
 };
+use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
@@ -84,11 +89,22 @@ pub struct Connection {
     pub(super) query_only: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
+    /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
+    /// in DML statements fall back to string literals instead of raising an error.
+    pub(super) dqs_dml: AtomicBool,
+    /// Deprecated pragma: when ON, column names include table prefix (TABLE.COLUMN)
+    pub(super) full_column_names: AtomicBool,
+    /// Deprecated pragma: when ON (default), column refs use just the column name
+    pub(super) short_column_names: AtomicBool,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
+    #[cfg(any(test, injected_yields))]
+    pub(super) yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
+    #[cfg(any(test, injected_yields))]
+    pub(super) yield_instance_id_counter: AtomicU64,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
@@ -116,6 +132,13 @@ pub struct Connection {
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
     pub(super) busy_handler: RwLock<BusyHandler>,
+    /// Step-based progress callback for SQLite-compatible cancellation hooks.
+    pub(super) progress_handler: ProgressHandler,
+    /// Maximum execution time for a single statement on this connection.
+    /// `Duration::ZERO` means disabled.
+    pub(super) query_timeout_ms: AtomicU64,
+    /// True when sqlite3_interrupt()-style cancellation is pending for active root statements.
+    pub(super) interrupt_requested: AtomicBool,
     /// Whether this is an internal connection used for MVCC bootstrap
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
@@ -123,6 +146,11 @@ pub struct Connection {
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Number of active write statements on this connection.
     pub(crate) n_active_writes: AtomicI32,
+    /// Number of active root statements currently executing on this connection.
+    /// This is Turso's equivalent of SQLite's top-level active-VDBE count
+    /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
+    /// subprogram execution.
+    pub(crate) n_active_root_statements: AtomicI32,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
     /// Per-connection override for custom types (set when switching to PG dialect)
@@ -287,110 +315,27 @@ impl Connection {
         }
     }
 
-    /// Parse PostgreSQL SQL using pg_query and translate to Turso AST
-    pub(crate) fn parse_postgresql_sql(&self, sql: &str) -> Result<Option<Cmd>> {
-        // Parse using pg_query
-        let parse_result = turso_parser_pg::parse(sql)
-            .map_err(|e| LimboError::ParseError(format!("PostgreSQL parse error: {e}")))?;
-
-        // Translate to Turso AST
-        let translator = turso_parser_pg::translator::PostgreSQLTranslator::new();
-        let stmt = translator
-            .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(format!("PostgreSQL translation error: {e}")))?;
-
-        // Wrap in Cmd
-        Ok(Some(Cmd::Stmt(stmt)))
-    }
-
-    /// Handle PG session/schema commands that need connection state.
-    /// Handles: SET (→ PRAGMA), SHOW (→ PRAGMA), CREATE/DROP SCHEMA.
-    /// Returns Some(Statement) if handled, None to fall through to standard parse path.
-    pub(crate) fn try_prepare_pg(self: &Arc<Self>, sql: &str) -> Result<Option<Statement>> {
-        use turso_parser_pg::translator::{
-            try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-        };
-
-        // If pg_query can't parse the SQL, return None to fall through.
-        let parse_result = match turso_parser_pg::parse(sql) {
-            Ok(result) => result,
-            Err(_) => return Ok(None),
-        };
-
-        // SET name = value → PRAGMA name = value
-        if let Some(set_stmt) = try_extract_set(&parse_result) {
-            let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, set_stmt.value);
-            return Ok(Some(self.prepare_sqlite_sql(&pragma_sql)?));
-        }
-
-        // SHOW name → PRAGMA name
-        if let Some(show_stmt) = try_extract_show(&parse_result) {
-            let pragma_sql = format!("PRAGMA {}", show_stmt.name);
-            return Ok(Some(self.prepare_sqlite_sql(&pragma_sql)?));
-        }
-
-        // CREATE SCHEMA → ATTACH database
-        if let Some(cs) = try_extract_create_schema(&parse_result) {
-            self.handle_pg_create_schema(&cs)?;
-            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
-        }
-
-        // DROP SCHEMA → DROP tables + DETACH database
-        if let Some(ds) = try_extract_drop_schema(&parse_result) {
-            self.handle_pg_drop_schema(&ds)?;
-            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
-        }
-
-        Ok(None)
-    }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self._prepare(sql)
     }
 
-    /// Prepare a statement using the SQLite parser, regardless of connection dialect.
-    /// Used for internal queries (e.g. ParseSchema) that operate on SQLite internals
-    /// and must not be affected by the user-facing SQL dialect setting.
-    /// Parse SQL with the SQLite parser without changing the connection dialect.
-    /// Used for SET/SHOW → PRAGMA translation where the current dialect must be
-    /// preserved (PRAGMAs like sql_dialect read the dialect at compile time).
-    fn prepare_sqlite_sql(self: &Arc<Self>, sql: &str) -> Result<Statement> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
-        let byte_offset_end = parser.offset();
-        let syms = self.syms.read();
-        let cmd = cmd.expect("Internal SQL should always produce a command");
-        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-            .unwrap()
-            .trim();
-        self.maybe_update_schema();
-        let pager = self.pager.load().clone();
-        let mode = QueryMode::new(&cmd);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-        let schema = self.schema.read().clone();
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-        )?;
-        Ok(Statement::new(program, pager, mode, 0))
-    }
-
-    pub fn prepare_internal(self: &Arc<Self>, sql: &str) -> Result<Statement> {
-        // Temporarily force SQLite dialect so the planner doesn't hide internal
-        // tables like sqlite_schema when the connection is in Postgres mode.
-        let saved_dialect = self.get_sql_dialect();
-        self.set_sql_dialect(SqlDialect::Sqlite);
-        let result = self._prepare(sql);
-        self.set_sql_dialect(saved_dialect);
-        result
+    pub(crate) fn prepare_internal(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+    ) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
     }
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::Root)
+    }
+
+    pub(crate) fn prepare_with_origin(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        origin: StatementOrigin,
+    ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -400,71 +345,128 @@ impl Connection {
             ));
         }
 
-        let sql = sql.as_ref();
-        tracing::debug!("Preparing: {}", sql);
-
-        // For PG dialect, try PG-specific path first (CREATE TABLE, SET, SHOW, etc.)
-        if self.get_sql_dialect() == SqlDialect::Postgres {
-            if let Some(stmt) = self.try_prepare_pg(sql)? {
-                return Ok(stmt);
-            }
+        let needs_nested_guard = origin.needs_nested_guard();
+        if needs_nested_guard {
+            self.start_nested();
         }
-
-        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
-        let syms = self.syms.read();
-        let cmd = match cmd {
-            Some(cmd) => cmd,
-            None => {
-                return Err(LimboError::InvalidArgument(
-                    "The supplied SQL string contains no statements".to_string(),
-                ));
-            }
+        // Internal helpers are always SQLite SQL (e.g. ParseSchema queries)
+        // that need access to sqlite_schema and other engine-internal tables.
+        // Force SQLite dialect so the parser uses the SQLite grammar and the
+        // planner resolves these internal tables (which are intentionally
+        // hidden from user-facing queries in Postgres mode).
+        let saved_dialect = if origin == StatementOrigin::InternalHelper {
+            let d = self.get_sql_dialect();
+            self.set_sql_dialect(SqlDialect::Sqlite);
+            Some(d)
+        } else {
+            None
         };
-        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-            .unwrap()
-            .trim();
-        self.maybe_update_schema();
-        let pager = self.pager.load().clone();
-        let mode = QueryMode::new(&cmd);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let result = (|| {
+            let sql = sql.as_ref();
+            tracing::debug!("Preparing: {}", sql);
 
-        // Read lock + Arc::Clone the schema here to avoid a possible recursive read lock in `op_parse_schema`,
-        // where we try to read the schema again there
-        let schema = self.schema.read().clone();
+            // For PG dialect, try PG-specific path first (CREATE TABLE, SET, SHOW, etc.)
+            if self.get_sql_dialect() == SqlDialect::Postgres {
+                if let Some(stmt) = self.try_prepare_pg(sql)? {
+                    return Ok(stmt);
+                }
+            }
 
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-        )?;
-        Ok(Statement::new(program, pager, mode, byte_offset_end))
+            let (cmd, byte_offset_end) = self.parse_sql(sql)?;
+            let syms = self.syms.read();
+            let cmd = match cmd {
+                Some(cmd) => cmd,
+                None => {
+                    return Err(LimboError::InvalidArgument(
+                        "The supplied SQL string contains no statements".to_string(),
+                    ));
+                }
+            };
+            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                .unwrap()
+                .trim();
+            self.maybe_update_schema();
+            let pager = self.pager.load().clone();
+            let mode = QueryMode::new(&cmd);
+            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+
+            // Read lock + Arc::Clone the schema here to avoid a possible recursive read lock in `op_parse_schema`,
+            // where we try to read the schema again there
+            let schema = self.schema.read().clone();
+
+            let program = translate::translate(
+                &schema,
+                stmt,
+                pager.clone(),
+                self.clone(),
+                &syms,
+                mode,
+                input,
+            )?;
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                byte_offset_end,
+                origin,
+                needs_nested_guard,
+            ))
+        })();
+        if let Some(d) = saved_dialect {
+            self.set_sql_dialect(d);
+        }
+        if result.is_err() && needs_nested_guard {
+            self.end_nested();
+        }
+        result
     }
 
     /// Prepare a statement from an AST node directly, skipping SQL parsing.
     /// This is more efficient when AST is already available or constructed programmatically.
     pub fn prepare_stmt(self: &Arc<Connection>, stmt: ast::Stmt) -> Result<Statement> {
+        self.prepare_stmt_with_origin(stmt, StatementOrigin::Root)
+    }
+
+    fn prepare_stmt_with_origin(
+        self: &Arc<Connection>,
+        stmt: ast::Stmt,
+        origin: StatementOrigin,
+    ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.maybe_update_schema();
-        let syms = self.syms.read();
-        let pager = self.pager.load().clone();
-        let mode = QueryMode::Normal;
-        let schema = self.schema.read().clone();
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            "<ast>", // No SQL input string available
-        )?;
-        Ok(Statement::new(program, pager, mode, 0))
+        let needs_nested_guard = origin.needs_nested_guard();
+        if needs_nested_guard {
+            self.start_nested();
+        }
+        let result = (|| {
+            self.maybe_update_schema();
+            let syms = self.syms.read();
+            let pager = self.pager.load().clone();
+            let mode = QueryMode::Normal;
+            let schema = self.schema.read().clone();
+            let program = translate::translate(
+                &schema,
+                stmt,
+                pager.clone(),
+                self.clone(),
+                &syms,
+                mode,
+                "<ast>", // No SQL input string available
+            )?;
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                0,
+                origin,
+                needs_nested_guard,
+            ))
+        })();
+        if result.is_err() && needs_nested_guard {
+            self.end_nested();
+        }
+        result
     }
 
     /// Whether this is an internal connection used for MVCC bootstrap
@@ -1365,7 +1367,7 @@ impl Connection {
 
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
-        if index <= 1 {
+        if !is_attached_db(index) {
             self.db.is_readonly()
         } else {
             let db = self.attached_databases.read().get_database_by_index(index);
@@ -1582,6 +1584,39 @@ impl Connection {
         }
     }
 
+    #[cfg(any(test, injected_yields))]
+    pub fn set_yield_injector(&self, injector: Option<Arc<dyn YieldInjector>>) {
+        let mut slot = self.yield_injector.write();
+        match injector {
+            Some(injector) => {
+                turso_assert!(
+                    slot.is_none(),
+                    "yield injector should be empty before installing a new one"
+                );
+                *slot = Some(injector);
+            }
+            None => {
+                turso_assert!(
+                    slot.is_some(),
+                    "yield injector should be installed before it is cleared"
+                );
+                *slot = None;
+            }
+        }
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
+        self.yield_injector.read().clone()
+    }
+
+    #[cfg(any(test, injected_yields))]
+    #[inline(always)]
+    pub(crate) fn next_yield_instance_id(&self) -> u64 {
+        self.yield_instance_id_counter
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Query the current value(s) of `pragma_name` associated to
     /// `pragma_value`.
     ///
@@ -1628,7 +1663,7 @@ impl Connection {
         database_id: usize,
         f: impl FnOnce(&mut Schema) -> T,
     ) -> T {
-        if !crate::is_attached_db(database_id) {
+        if !is_attached_db(database_id) {
             self.with_schema_mut(f)
         } else {
             // For attached databases, update a connection-local copy of the schema.
@@ -1656,7 +1691,7 @@ impl Connection {
     }
 
     pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
-        if *index < 2 {
+        if !is_attached_db(*index) {
             self.pager.load().clone()
         } else {
             self.attached_databases.read().get_pager_by_index(index)
@@ -1667,119 +1702,187 @@ impl Connection {
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
         match index {
-            0 => Some("main".to_string()),
-            1 => Some("temp".to_string()),
+            MAIN_DB_ID => Some("main".to_string()),
+            TEMP_DB_ID => Some("temp".to_string()),
             _ => self.attached_databases.read().get_name_by_index(index),
         }
     }
 
-    /// Handle CREATE SCHEMA in PostgreSQL mode.
-    /// Maps to ATTACH with an in-memory database.
-    /// File-backed persistence (turso-postgres-schema-<name>.db) is handled by the CLI layer.
-    fn handle_pg_create_schema(
-        self: &Arc<Self>,
-        stmt: &turso_parser_pg::translator::PgCreateSchemaStmt,
-    ) -> Result<()> {
-        let name = stmt.name.to_lowercase();
-        if name == "public" {
-            // "public" always exists
-            if stmt.if_not_exists {
-                return Ok(());
-            }
-            return Err(LimboError::ParseError(format!(
-                "schema \"{name}\" already exists"
-            )));
+    /// Get the database id for a schema name ("main", "temp", or an attached db alias).
+    pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
+        let normalized: String = crate::util::normalize_ident(name);
+        match normalized.as_str() {
+            "main" => Ok(MAIN_DB_ID),
+            "temp" => Ok(TEMP_DB_ID),
+            _ => self
+                .attached_databases
+                .read()
+                .get_database_by_name(&normalized)
+                .map(|(idx, _)| idx)
+                .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}"))),
         }
-        if self.is_attached(&name) {
-            if stmt.if_not_exists {
-                return Ok(());
-            }
-            return Err(LimboError::ParseError(format!(
-                "schema \"{name}\" already exists"
-            )));
-        }
-        self.attach_database(":memory:", &name)
     }
 
-    /// Handle DROP SCHEMA in PostgreSQL mode.
-    /// For "public": drops all user tables from main DB.
-    /// For other schemas: drops all tables, then DETACHes.
-    fn handle_pg_drop_schema(
-        self: &Arc<Self>,
-        stmt: &turso_parser_pg::translator::PgDropSchemaStmt,
-    ) -> Result<()> {
-        let name = stmt.name.to_lowercase();
-        if name == "public" {
-            return self.handle_pg_drop_schema_public(stmt.cascade);
+    /// Get the Database object for a given database id.
+    pub(crate) fn get_source_database(&self, database_id: usize) -> Arc<Database> {
+        if !is_attached_db(database_id) {
+            self.db.clone()
+        } else {
+            self.attached_databases
+                .read()
+                .get_database_by_index(database_id)
+                .expect("database index should be valid")
         }
-        if !self.is_attached(&name) {
-            if stmt.if_exists {
-                return Ok(());
-            }
-            return Err(LimboError::ParseError(format!(
-                "schema \"{name}\" does not exist"
-            )));
-        }
-        if stmt.cascade {
-            self.drop_all_tables_in_schema(&name)?;
-        }
-        self.detach_database(&name)
     }
 
-    /// Drop all user tables in the main ("public") schema.
-    fn handle_pg_drop_schema_public(self: &Arc<Self>, cascade: bool) -> Result<()> {
-        let table_names = self.list_user_tables(None)?;
-        if !cascade && !table_names.is_empty() {
-            return Err(LimboError::ParseError(
-                "cannot drop schema \"public\" because other objects depend on it".to_string(),
-            ));
-        }
-        for table_name in table_names {
-            let sql = format!("DROP TABLE \"{table_name}\"");
-            let mut stmt = self.prepare_internal(&sql)?;
-            stmt.run_ignore_rows()?;
-        }
-        Ok(())
-    }
-
-    /// Drop all tables in an attached schema.
-    fn drop_all_tables_in_schema(self: &Arc<Self>, schema_name: &str) -> Result<()> {
-        let table_names = self.list_user_tables(Some(schema_name))?;
-        for table_name in table_names {
-            let sql = format!("DROP TABLE \"{schema_name}\".\"{table_name}\"");
-            let mut stmt = self.prepare_internal(&sql)?;
-            stmt.run_ignore_rows()?;
-        }
-        Ok(())
-    }
-
-    /// List user-visible table names in a schema.
-    /// If schema_name is None, queries main DB's sqlite_schema.
-    /// If schema_name is Some(name), queries name.sqlite_schema.
-    fn list_user_tables(self: &Arc<Self>, schema_name: Option<&str>) -> Result<Vec<String>> {
-        let sql = match schema_name {
-            Some(name) => format!(
-                "SELECT name FROM \"{name}\".sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            ),
-            None => "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'".to_string(),
-        };
-        let mut stmt = self.prepare_internal(&sql)?;
-        let rows = stmt.run_collect_rows()?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| match row.first() {
-                Some(Value::Text(t)) => Some(t.as_str().to_string()),
-                _ => None,
-            })
-            .collect())
-    }
-
-    #[cfg(feature = "fs")]
-    fn is_attached(&self, alias: &str) -> bool {
+    pub(crate) fn is_attached(&self, alias: &str) -> bool {
         self.attached_databases
             .read()
             .name_to_index
             .contains_key(alias)
+    }
+
+    /// Returns the reserved-space value inherited from the main connection's pager.
+    /// (This reads the main database pager, not the pager of db to be attached)
+    fn inherited_reserved_space_for_fresh_attach(&self) -> u8 {
+        let pager = self.pager.load();
+        pager
+            .get_reserved_space()
+            .unwrap_or_else(|| pager.io_ctx.read().get_reserved_space_bytes())
+    }
+
+    /// Returns the minimum reserved space required by the attached pager's own IO context.
+    /// This is used as a floor so inherited or explicit values cannot undercut the attached DB.
+    fn minimum_reserved_space_for_fresh_attach(pager: &Pager) -> u8 {
+        pager
+            .get_reserved_space()
+            .unwrap_or(0)
+            .max(pager.io_ctx.read().get_reserved_space_bytes())
+    }
+
+    fn database_has_existing_wal_state(db: &Database) -> bool {
+        let shared_wal = db.shared_wal.read();
+        shared_wal.page_size() != 0 || shared_wal.last_checksum_and_max_frame().1 != 0
+    }
+
+    fn install_database_wal_on_pager(db: &Arc<Database>, pager: &mut Arc<Pager>) {
+        let shared_wal = db.shared_wal.clone();
+        let last_checksum_and_max_frame = shared_wal.read().last_checksum_and_max_frame();
+        let wal = Arc::new(crate::storage::wal::WalFile::new(
+            db.io.clone(),
+            shared_wal,
+            last_checksum_and_max_frame,
+            db.buffer_pool.clone(),
+        ));
+
+        let pager = Arc::get_mut(pager)
+            .expect("fresh attached pager must not be shared before bootstrap or publication");
+        pager.set_wal(wal);
+    }
+
+    fn set_mvcc_journal_mode_fresh_db(pager: &Pager) -> Result<()> {
+        turso_assert!(!pager.db_initialized());
+        pager.set_initial_journal_version(crate::storage::sqlite3_ondisk::Version::Mvcc)
+    }
+
+    fn validate_attach_target(db: &Database, is_fresh: bool, alias: &str) -> Result<()> {
+        if is_fresh && Self::database_has_existing_wal_state(db) {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot attach database '{alias}': main database file is uninitialized but WAL state exists"
+            )));
+        }
+
+        if is_fresh && db.is_readonly() {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot attach database '{alias}': fresh read-only databases cannot be initialized during attach"
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_page_layout_to_fresh_attach_db(
+        &self,
+        alias: &str,
+        attached_db_pager: &Pager,
+        reserved_space: Option<u8>,
+    ) -> Result<()> {
+        let target_page_size = self.get_page_size();
+        let attached_min_reserved_space =
+            Self::minimum_reserved_space_for_fresh_attach(attached_db_pager);
+        let target_reserved_space = match reserved_space {
+            Some(space) => {
+                // this happens reserved_space is explicitly passed along with encryption or checksum
+                if space < attached_min_reserved_space {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "cannot attach database '{alias}': reserved space {space} is smaller than attached database minimum {attached_min_reserved_space}"
+                    )));
+                }
+                Some(space)
+            }
+            None => Some(
+                self.inherited_reserved_space_for_fresh_attach()
+                    .max(attached_min_reserved_space),
+            ),
+        };
+
+        attached_db_pager.set_initial_page_size(target_page_size)?;
+        if let Some(reserved_space) = target_reserved_space {
+            attached_db_pager.set_reserved_space_bytes(reserved_space);
+        }
+        Ok(())
+    }
+
+    fn reject_initialized_attach_mismatches(
+        &self,
+        alias: &str,
+        db: &Database,
+        pager: &Pager,
+    ) -> Result<()> {
+        // Reject incompatible journal modes for initialized attached databases:
+        // we cannot silently convert the header (the user may have attached read-only).
+        if self.mvcc_enabled() != db.mvcc_enabled() {
+            let main_mode = if self.mvcc_enabled() { "MVCC" } else { "WAL" };
+            let attached_mode = if db.mvcc_enabled() { "MVCC" } else { "WAL" };
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot attach database '{alias}': main database uses {main_mode} journal mode \
+                 but attached database uses {attached_mode}. Both must use the same journal mode."
+            )));
+        }
+
+        // Reject mismatched page sizes: ephemeral tables and cross-database
+        // operations assume a uniform page size across all attached databases.
+        let main_pager = self.pager.load();
+        if let (Some(main_ps), Some(attached_ps)) =
+            (main_pager.get_page_size(), pager.get_page_size())
+        {
+            if main_ps != attached_ps {
+                return Err(LimboError::InvalidArgument(format!(
+                    "cannot attach database '{alias}': page size mismatch \
+                     (main={main_ps:?}, attached={attached_ps:?})"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reject_unsupported_fresh_mvcc_attach_durable_storage(
+        &self,
+        alias: &str,
+        db: &Database,
+        attached_is_fresh: bool,
+    ) -> Result<()> {
+        if attached_is_fresh
+            && self.mvcc_enabled()
+            && self.db.durable_storage.is_some()
+            && db.durable_storage.is_none()
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot attach database '{alias}': fresh MVCC attach does not support inheriting custom durable storage"
+            )));
+        }
+
+        Ok(())
     }
 
     /// Attach a database file with the given alias name
@@ -1790,9 +1893,43 @@ impl Connection {
         )));
     }
 
+    #[cfg(not(feature = "fs"))]
+    pub(crate) fn attach_database_with_config(
+        &self,
+        _path: &str,
+        _alias: &str,
+        _reserved_space: Option<u8>,
+    ) -> Result<()> {
+        // File-backed ATTACH is unavailable without `fs`, so pre-initialization
+        // page-layout overrides are also unsupported in this build.
+        self.attach_database(_path, _alias)
+    }
+
     /// Attach a database file with the given alias name
     #[cfg(feature = "fs")]
     pub(crate) fn attach_database(&self, path: &str, alias: &str) -> Result<()> {
+        self.attach_database_inner(path, alias, None)
+    }
+
+    /// Attach a database file with an optional pre-initialization reserved-space override.
+    #[cfg(feature = "fs")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn attach_database_with_config(
+        &self,
+        path: &str,
+        alias: &str,
+        reserved_space: Option<u8>,
+    ) -> Result<()> {
+        self.attach_database_inner(path, alias, reserved_space)
+    }
+
+    #[cfg(feature = "fs")]
+    fn attach_database_inner(
+        &self,
+        path: &str,
+        alias: &str,
+        reserved_space: Option<u8>,
+    ) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1810,14 +1947,12 @@ impl Connection {
             )));
         }
 
-        let use_views = self.db.experimental_views_enabled();
-        let use_custom_types = self.db.experimental_custom_types_enabled();
-        let use_postgres = self.db.experimental_postgres_enabled();
-
         let db_opts = DatabaseOpts::new()
-            .with_views(use_views)
-            .with_custom_types(use_custom_types)
-            .with_postgres(use_postgres);
+            .with_views(self.db.experimental_views_enabled())
+            .with_custom_types(self.db.experimental_custom_types_enabled())
+            .with_index_method(self.db.experimental_index_method_enabled())
+            .with_generated_columns(self.db.experimental_generated_columns_enabled())
+            .with_postgres(self.db.experimental_postgres_enabled());
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also
@@ -1835,51 +1970,46 @@ impl Connection {
         };
         let main_db_flags = self.db.open_flags;
         let (db, encryption_opts) = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+        let attached_is_fresh = !db.initialized();
+        if !is_memory_db {
+            Self::validate_attach_target(&db, attached_is_fresh, alias)?;
+        }
+        self.reject_unsupported_fresh_mvcc_attach_durable_storage(alias, &db, attached_is_fresh)?;
+
         // Build encryption key from URI opts to pass to _init for decrypting page 1.
         let encryption_key = if let Some(ref enc) = encryption_opts {
             Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
         } else {
             None
         };
-        let pager = Arc::new(db._init(encryption_key.as_ref())?);
-        // In-memory attached databases inherit the main database's journal mode.
-        // A fresh :memory: DB defaults to WAL, so when main is MVCC we need to
-        // create an MvStore for the attached DB so it runs in the same mode.
-        if is_memory_db && self.mvcc_enabled() && !db.mvcc_enabled() {
-            // todo(v): pass required encryption ctx to enable encryption with mvcc
+        let mut pager = Arc::new(db._init(encryption_key.as_ref())?);
+
+        if !attached_is_fresh {
+            self.reject_initialized_attach_mismatches(alias, &db, &pager)?;
+            self.attached_databases.write().insert(alias, (db, pager));
+            self.bump_prepare_context_generation();
+            return Ok(());
+        }
+
+        self.apply_page_layout_to_fresh_attach_db(alias, &pager, reserved_space)?;
+
+        // Fresh attached databases inherit the main connection's journal mode.
+        // The header must be normalized before page 1 allocation so the first
+        // write and MVCC bootstrap agree on the target mode.
+        if self.mvcc_enabled() && !db.mvcc_enabled() {
+            Self::set_mvcc_journal_mode_fresh_db(&pager)?;
+            Self::install_database_wal_on_pager(&db, &mut pager);
+            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 db.io.clone(),
                 &db.path,
                 db.open_flags,
                 db.durable_storage.clone(),
-                None,
+                enc_ctx,
             )?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
             mv_store.bootstrap(bootstrap_conn)?;
-        }
-        // Reject incompatible journal modes for file-based databases: we cannot
-        // silently convert the header (the user may have attached read-only).
-        if self.mvcc_enabled() != db.mvcc_enabled() {
-            let main_mode = if self.mvcc_enabled() { "MVCC" } else { "WAL" };
-            let attached_mode = if db.mvcc_enabled() { "MVCC" } else { "WAL" };
-            return Err(LimboError::InvalidArgument(format!(
-                "cannot attach database '{alias}': main database uses {main_mode} journal mode \
-                 but attached database uses {attached_mode}. Both must use the same journal mode."
-            )));
-        }
-        // Reject mismatched page sizes: ephemeral tables and cross-database
-        // operations assume a uniform page size across all attached databases.
-        let main_pager = self.pager.load();
-        if let (Some(main_ps), Some(attached_ps)) =
-            (main_pager.get_page_size(), pager.get_page_size())
-        {
-            if main_ps != attached_ps {
-                return Err(LimboError::InvalidArgument(format!(
-                    "cannot attach database '{alias}': page size mismatch \
-                     (main={main_ps:?}, attached={attached_ps:?})"
-                )));
-            }
         }
         self.attached_databases.write().insert(alias, (db, pager));
         self.bump_prepare_context_generation();
@@ -2000,7 +2130,7 @@ impl Connection {
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
-            crate::MAIN_DB_ID | crate::TEMP_DB_ID => {
+            MAIN_DB_ID | TEMP_DB_ID => {
                 // Main database - use connection's schema which should be kept in sync
                 // NOTE: for Temp databases, for now they can use the connection-local schema
                 // but this will change in the future
@@ -2050,7 +2180,7 @@ impl Connection {
 
         // Add main database (always seq=0, name="main")
         let main_path = Self::get_canonical_path_for_database(&self.db);
-        databases.push((0, "main".to_string(), main_path));
+        databases.push((MAIN_DB_ID, "main".to_string(), main_path));
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
@@ -2088,6 +2218,33 @@ impl Connection {
 
     pub fn set_dml_require_where(&self, value: bool) {
         self.dml_require_where.store(value, Ordering::SeqCst);
+    }
+
+    pub fn get_dqs_dml(&self) -> bool {
+        self.dqs_dml.load(Ordering::SeqCst)
+    }
+
+    pub fn set_dqs_dml(&self, value: bool) {
+        self.dqs_dml.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn get_full_column_names(&self) -> bool {
+        self.full_column_names.load(Ordering::SeqCst)
+    }
+
+    pub fn set_full_column_names(&self, value: bool) {
+        self.full_column_names.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn get_short_column_names(&self) -> bool {
+        self.short_column_names.load(Ordering::SeqCst)
+    }
+
+    pub fn set_short_column_names(&self, value: bool) {
+        self.short_column_names.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {
@@ -2169,6 +2326,7 @@ impl Connection {
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
         tracing::trace!("setting encryption key for connection");
+        self.ensure_can_change_encryption_settings()?;
         *self.encryption_key.write() = Some(key);
         self.bump_prepare_context_generation();
         self.set_encryption_context()
@@ -2176,6 +2334,7 @@ impl Connection {
 
     pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
         tracing::trace!("setting encryption cipher for connection");
+        self.ensure_can_change_encryption_settings()?;
         self.encryption_cipher_mode.set(cipher_mode);
         self.bump_prepare_context_generation();
         self.set_encryption_context()
@@ -2201,6 +2360,22 @@ impl Connection {
         }
     }
 
+    fn ensure_can_change_encryption_settings(&self) -> Result<()> {
+        let pager = self.pager.load();
+        if pager.is_encryption_ctx_set() {
+            return Err(LimboError::InvalidArgument(
+                "cannot reset encryption attributes if already set in the session".to_string(),
+            ));
+        }
+        if self.db.get_mv_store().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "cannot enable encryption after MVCC is active; configure encryption before PRAGMA journal_mode='mvcc'"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     // if both key and cipher are set, set encryption context on pager
     fn set_encryption_context(&self) -> Result<()> {
         let key_guard = self.encryption_key.read();
@@ -2213,11 +2388,6 @@ impl Connection {
         };
         tracing::trace!("setting encryption ctx for connection");
         let pager = self.pager.load();
-        if pager.is_encryption_ctx_set() {
-            return Err(LimboError::InvalidArgument(
-                "cannot reset encryption attributes if already set in the session".to_string(),
-            ));
-        }
         pager.set_encryption_context(cipher_mode, key)
     }
 
@@ -2248,9 +2418,52 @@ impl Connection {
         }
     }
 
+    /// Sets the maximum duration a statement is allowed to run.
+    /// `Duration::ZERO` disables query timeout.
+    pub fn set_query_timeout(&self, duration: Duration) {
+        let millis = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.query_timeout_ms.store(millis, Ordering::SeqCst);
+    }
+
+    /// Get the query timeout duration.
+    pub fn get_query_timeout(&self) -> Duration {
+        Duration::from_millis(self.query_timeout_ms.load(Ordering::SeqCst))
+    }
+
     /// Get a reference to the busy handler.
     pub fn get_busy_handler(&self) -> crate::sync::RwLockReadGuard<'_, BusyHandler> {
         self.busy_handler.read()
+    }
+
+    /// Sets a progress handler invoked approximately every `ops` VM steps.
+    /// Passing `ops == 0` or `None` disables the progress handler.
+    pub fn set_progress_handler(&self, ops: u64, handler: Option<ProgressHandlerCallback>) {
+        self.progress_handler.set(ops, handler);
+    }
+
+    /// Returns true when the step-based progress handler requests interruption.
+    pub fn should_interrupt_for_progress(&self, vm_steps: u64) -> bool {
+        self.progress_handler.should_interrupt(vm_steps)
+    }
+
+    /// Request interruption of currently running root statements on this connection.
+    /// If no root statement is active, the request is ignored to match SQLite semantics.
+    pub fn interrupt(&self) {
+        if self.n_active_root_statements.load(Ordering::SeqCst) > 0 {
+            self.interrupt_requested.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Returns true if an interrupt is currently pending for this connection.
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupt_requested.load(Ordering::SeqCst)
+    }
+
+    /// Clear the connection interrupt once no root statements remain active.
+    pub(crate) fn clear_interrupt_if_idle(&self) {
+        if self.n_active_root_statements.load(Ordering::SeqCst) == 0 {
+            self.interrupt_requested.store(false, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn set_tx_state(&self, state: TransactionState) {
@@ -2284,7 +2497,7 @@ impl Connection {
     /// Get MVCC transaction ID for a specific database.
     /// Uses fast path for main DB, O(1) HashMap lookup for attached DBs.
     pub(crate) fn get_mv_tx_id_for_db(&self, db: usize) -> Option<u64> {
-        if !crate::is_attached_db(db) {
+        if !is_attached_db(db) {
             self.get_mv_tx_id()
         } else {
             self.attached_mv_txs
@@ -2296,7 +2509,7 @@ impl Connection {
 
     /// Get MVCC transaction ID and mode for a specific database.
     pub(crate) fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
-        if !crate::is_attached_db(db) {
+        if !is_attached_db(db) {
             self.get_mv_tx()
         } else {
             self.attached_mv_txs.read().get(&db).copied()
@@ -2305,7 +2518,7 @@ impl Connection {
 
     /// Set MVCC transaction for a specific database.
     pub(crate) fn set_mv_tx_for_db(&self, db: usize, val: Option<(u64, TransactionMode)>) {
-        if !crate::is_attached_db(db) {
+        if !is_attached_db(db) {
             self.set_mv_tx(val);
         } else {
             let mut txs = self.attached_mv_txs.write();
@@ -2393,7 +2606,7 @@ impl Connection {
         if self.is_mvcc_bootstrap_connection() {
             return None;
         }
-        if !crate::is_attached_db(db) {
+        if !is_attached_db(db) {
             self.db.get_mv_store().as_ref().cloned()
         } else {
             let catalog = self.attached_databases.read();
@@ -2495,5 +2708,109 @@ impl SymbolTable {
         for (name, module) in &other.index_methods {
             self.index_methods.insert(name.clone(), module.clone());
         }
+    }
+}
+
+#[cfg(all(test, feature = "fs"))]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn open_connection(path: &std::path::Path) -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        db.connect().unwrap()
+    }
+
+    // given a attached 'alias', return the Database and Pager for that attached database
+    fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
+        let catalog = conn.attached_databases.read();
+        let index = *catalog.name_to_index.get(alias).unwrap();
+        catalog.index_to_data.get(&index).unwrap().clone()
+    }
+
+    #[test]
+    fn test_attach_database_with_config_overrides_reserved_space_before_initialization() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let aux_path = temp_dir.path().join("aux.db");
+        let conn = open_connection(&main_path);
+
+        conn.attach_database_with_config(aux_path.to_str().unwrap(), "aux", Some(48))
+            .unwrap();
+
+        let (attached_db, pager) = attached_entry(&conn, "aux");
+        assert!(!attached_db.initialized());
+        assert!(!pager.db_initialized());
+        assert_eq!(pager.get_reserved_space(), Some(48));
+    }
+
+    #[cfg(feature = "checksum")]
+    #[test]
+    fn test_attach_database_with_config_rejects_reserved_space_below_minimum() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let aux_path = temp_dir.path().join("aux.db");
+        let conn = open_connection(&main_path);
+
+        let err = conn
+            .attach_database_with_config(aux_path.to_str().unwrap(), "aux", Some(0))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "Invalid argument supplied: cannot attach database 'aux': reserved space 0 is smaller than attached database minimum 8"
+        );
+    }
+
+    #[test]
+    fn test_fresh_mvcc_attach_installs_wal_before_bootstrap() {
+        // this is a test to check that mvcc db on attach with a fresh db, makes the
+        // attached db also mvcc
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let aux_path = temp_dir.path().join("aux.db");
+        let conn = open_connection(&main_path);
+
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.attach_database(aux_path.to_str().unwrap(), "aux")
+            .unwrap();
+
+        let (attached_db, pager) = attached_entry(&conn, "aux");
+        assert!(attached_db.get_mv_store().as_ref().is_some());
+        assert!(pager.has_wal());
+
+        conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    #[test]
+    fn test_fresh_mvcc_attach_reuses_database_shared_wal() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let aux_path = temp_dir.path().join("aux.db");
+        let conn = open_connection(&main_path);
+
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.attach_database(aux_path.to_str().unwrap(), "aux")
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
+
+        let (attached_db, pager) = attached_entry(&conn, "aux");
+        let pager_shared_ptr = pager
+            .wal_shared_ptr()
+            .expect("fresh MVCC attach must expose WAL shared state in tests");
+        let db_shared_ptr = Arc::as_ptr(&attached_db.shared_wal) as usize;
+
+        assert_eq!(pager_shared_ptr, db_shared_ptr);
     }
 }

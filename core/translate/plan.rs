@@ -24,7 +24,7 @@ use crate::{
     },
     Result, VirtualTable,
 };
-use crate::{schema::Type, types::SeekOp};
+use crate::{schema::Type, types::SeekOp, MAIN_DB_ID};
 
 use turso_parser::ast::TableInternalId;
 
@@ -57,6 +57,11 @@ fn infer_type_from_expr(
 pub struct ResultSetColumn {
     pub expr: ast::Expr,
     pub alias: Option<String>,
+    /// Original SQL expression text for display as column name.
+    /// Only used when there is no explicit alias and the expression is not
+    /// a simple column reference. This preserves the verbatim SQL text
+    /// (e.g. "f1+F2") as the column name, matching SQLite behavior.
+    pub implicit_column_name: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
 }
@@ -100,7 +105,7 @@ impl ResultSetColumn {
                 // If there is no rowid alias, use "rowid".
                 Some("rowid")
             }
-            _ => None,
+            _ => self.implicit_column_name.as_deref(),
         }
     }
 }
@@ -112,6 +117,9 @@ pub struct GroupBy {
     /// `compute_group_by_sort_order` has run; the outer optimizer reads
     /// this to derive the materialized CTE's output order.
     pub sort_order: Vec<SortOrder>,
+    /// NULLS ordering for each GROUP BY key column. Populated when ORDER BY
+    /// with explicit NULLS FIRST/LAST is merged into GROUP BY.
+    pub nulls_order: Vec<Option<ast::NullsOrder>>,
     /// When true the scan already provides the GROUP BY order and no
     /// sorter is emitted. The `sort_order` is kept so that the outer
     /// query can still read the effective output order.
@@ -300,9 +308,9 @@ pub enum Plan {
         right_most: SelectPlan,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order).
+        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order, nulls_order).
         /// The column index is 0-based into the result set.
-        order_by: Option<Vec<(usize, SortOrder)>>,
+        order_by: Option<Vec<(usize, SortOrder, Option<ast::NullsOrder>)>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),
@@ -347,24 +355,67 @@ impl Plan {
         }
     }
 
-    /// Returns the result columns for Select/CompoundSelect plans.
-    /// Returns None for Delete/Update plans.
-    pub fn select_result_columns(&self) -> Option<&[ResultSetColumn]> {
+    /// Returns the result columns of a SELECT or compound SELECT plan. For a
+    /// compound SELECT the columns of the right-most component are returned,
+    /// since every component must agree on column count and naming.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a DELETE or UPDATE plan, which have no result
+    /// columns.
+    pub fn select_result_columns(&self) -> &[ResultSetColumn] {
         match self {
-            Plan::Select(select_plan) => Some(&select_plan.result_columns),
-            Plan::CompoundSelect { right_most, .. } => Some(&right_most.result_columns),
-            Plan::Delete(_) | Plan::Update(_) => None,
+            Plan::Select(select_plan) => &select_plan.result_columns,
+            Plan::CompoundSelect { right_most, .. } => &right_most.result_columns,
+            Plan::Delete(_) | Plan::Update(_) => {
+                panic!("select_result_columns called on a non-SELECT plan")
+            }
         }
     }
 
-    /// Returns the table references for Select/CompoundSelect plans.
-    /// Returns None for Delete/Update plans.
-    pub fn select_table_references(&self) -> Option<&TableReferences> {
+    /// Returns the table references of a SELECT or compound SELECT plan. For
+    /// a compound SELECT the references of the right-most component are
+    /// returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a DELETE or UPDATE plan.
+    pub fn select_table_references(&self) -> &TableReferences {
         match self {
-            Plan::Select(select_plan) => Some(&select_plan.table_references),
-            Plan::CompoundSelect { right_most, .. } => Some(&right_most.table_references),
-            Plan::Delete(_) | Plan::Update(_) => None,
+            Plan::Select(select_plan) => &select_plan.table_references,
+            Plan::CompoundSelect { right_most, .. } => &right_most.table_references,
+            Plan::Delete(_) | Plan::Update(_) => {
+                panic!("select_table_references called on a non-SELECT plan")
+            }
         }
+    }
+
+    /// Returns the IDs of every outer-query reference that this plan actually
+    /// uses. For a compound SELECT, the result spans all of its component
+    /// SELECTs. DELETE and UPDATE plans have no outer-query references and
+    /// always return an empty vector.
+    pub fn used_outer_query_ref_ids(&self) -> Vec<TableInternalId> {
+        fn collect_from_select(plan: &SelectPlan, out: &mut Vec<TableInternalId>) {
+            for outer_ref in plan.table_references.outer_query_refs().iter() {
+                if outer_ref.is_used() {
+                    out.push(outer_ref.internal_id);
+                }
+            }
+        }
+        let mut ids = Vec::new();
+        match self {
+            Plan::Select(plan) => collect_from_select(plan, &mut ids),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (plan, _) in left {
+                    collect_from_select(plan, &mut ids);
+                }
+                collect_from_select(right_most, &mut ids);
+            }
+            Plan::Delete(_) | Plan::Update(_) => {}
+        }
+        ids
     }
 
     /// Returns true if this plan or any of its subplans read from the given table.
@@ -565,7 +616,7 @@ pub struct SelectPlan {
     /// group by clause
     pub group_by: Option<GroupBy>,
     /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause
@@ -687,7 +738,7 @@ pub struct DeletePlan {
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Vec<WhereTerm>,
     /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     /// limit clause
     pub limit: Option<Box<Expr>>,
     /// offset clause
@@ -714,7 +765,7 @@ pub struct UpdatePlan {
     // (column index, new value) pairs
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     pub limit: Option<Box<Expr>>,
     pub offset: Option<Box<Expr>>,
     // TODO: optional RETURNING clause
@@ -746,7 +797,8 @@ pub fn select_star(
     tables: &[JoinedTable],
     out_columns: &mut Vec<ResultSetColumn>,
     right_join_swapped: bool,
-) {
+    long_names: bool,
+) -> crate::Result<()> {
     // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
     let table_iter: Vec<&JoinedTable> = if right_join_swapped {
         tables.iter().rev().collect()
@@ -762,6 +814,36 @@ pub fn select_star(
             .is_some_and(|ji| ji.is_semi_or_anti())
         {
             continue;
+        }
+        // If this table's identifier appears more than once in the FROM clause,
+        // expanding * would produce ambiguous column references (matches SQLite).
+        // However, columns deduplicated by USING/NATURAL are not ambiguous.
+        let has_duplicate_identifier = tables
+            .iter()
+            .filter(|t| t.identifier == table.identifier)
+            .count()
+            > 1;
+        if has_duplicate_identifier {
+            // Collect all USING columns from duplicate tables (both this table's
+            // own join_info and the join_info of other tables with the same identifier).
+            let using_cols: Vec<&str> = tables
+                .iter()
+                .filter(|t| t.identifier == table.identifier)
+                .filter_map(|t| t.join_info.as_ref())
+                .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
+                .collect();
+            for col in table.columns().iter().filter(|c| !c.hidden()) {
+                if let Some(col_name) = &col.name {
+                    let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
+                    if !in_using {
+                        crate::bail_parse_error!(
+                            "ambiguous column name: {}.{}",
+                            table.identifier,
+                            col_name
+                        );
+                    }
+                }
+            }
         }
         out_columns.extend(
             table
@@ -782,18 +864,33 @@ pub fn select_star(
                         true
                     }
                 })
-                .map(|(i, col)| ResultSetColumn {
-                    alias: None,
-                    expr: ast::Expr::Column {
-                        database: None,
-                        table: table.internal_id,
-                        column: i,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    },
-                    contains_aggregates: false,
+                .map(|(i, col)| {
+                    // Like SQLite, SELECT * sets column names as aliases (ENAME_NAME),
+                    // bypassing full/short column name logic in get_column_name().
+                    // When long_names (full=ON, short=OFF), use "TABLE.COLUMN".
+                    // Otherwise, use just "COLUMN".
+                    let alias = col.name.as_ref().map(|col_name| {
+                        if long_names {
+                            format!("{}.{}", table.identifier, col_name)
+                        } else {
+                            col_name.clone()
+                        }
+                    });
+                    ResultSetColumn {
+                        alias,
+                        implicit_column_name: None,
+                        expr: ast::Expr::Column {
+                            database: None,
+                            table: table.internal_id,
+                            column: i,
+                            is_rowid_alias: col.is_rowid_alias(),
+                        },
+                        contains_aggregates: false,
+                    }
                 }),
         );
     }
+    Ok(())
 }
 
 /// The type of join between two tables.
@@ -929,6 +1026,10 @@ pub struct OuterQueryReference {
     /// col_used_mask because rowid is not a real column and setting a fake
     /// column index in col_used_mask could mislead covering index decisions.
     pub rowid_referenced: bool,
+    /// Scope depth for this outer reference. 0 = immediate outer scope,
+    /// 1 = grandparent scope, etc. Used to avoid false "ambiguous column"
+    /// errors when the same column name exists at different nesting depths.
+    pub scope_depth: usize,
 }
 
 impl OuterQueryReference {
@@ -1723,7 +1824,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             indexed: None,
         })
     }
@@ -1824,7 +1925,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             indexed: None,
         })
     }
@@ -2361,7 +2462,7 @@ pub struct Window {
     /// the leftmost columns in the subquery output make up the partition key.
     pub deduplicated_partition_by_len: Option<usize>,
     /// Expressions from the ORDER BY clause.
-    pub order_by: Vec<(Expr, SortOrder)>,
+    pub order_by: Vec<(Expr, SortOrder, Option<ast::NullsOrder>)>,
     /// All window functions associated with this window.
     pub functions: Vec<WindowFunction>,
 }
@@ -2385,6 +2486,7 @@ impl Window {
                     (
                         *col.expr.clone(),
                         col.order.unwrap_or(Self::DEFAULT_SORT_ORDER),
+                        col.nulls,
                     )
                 })
                 .collect(),
@@ -2415,9 +2517,10 @@ impl Window {
         self.order_by
             .iter()
             .zip(&ast.order_by)
-            .all(|((expr_a, order_a), col_b)| {
+            .all(|((expr_a, order_a, nulls_a), col_b)| {
                 exprs_are_equivalent(expr_a, &col_b.expr)
                     && *order_a == col_b.order.unwrap_or(Self::DEFAULT_SORT_ORDER)
+                    && *nulls_a == col_b.nulls
             })
     }
 
@@ -2468,7 +2571,7 @@ pub enum SubqueryState {
     /// The subquery has not been evaluated yet.
     /// The 'plan' field is only optional because it is .take()'d when the the subquery
     /// is translated into bytecode.
-    Unevaluated { plan: Option<Box<SelectPlan>> },
+    Unevaluated { plan: Option<Box<Plan>> },
     /// The subquery has been evaluated.
     /// The [evaluated_at] field contains the loop index where the subquery was evaluated.
     /// The query plan struct no longer exists because translating the plan currently
@@ -2545,7 +2648,7 @@ impl NonFromClauseSubquery {
     pub fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
         match &self.state {
             SubqueryState::Unevaluated { plan: Some(plan) } => {
-                plan.reads_table(database_id, table_name)
+                Plan::reads_table(plan, database_id, table_name)
             }
             _ => false,
         }
@@ -2567,26 +2670,19 @@ impl NonFromClauseSubquery {
                 return Ok(*evaluated_at);
             }
         };
-        eval_at_for_select_plan(plan, join_order, table_references)
+        eval_at_for_plan(plan, join_order, table_references)
     }
 
     /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
     ///
     /// This captures any outer references before the plan is moved so later
     /// phases can still reason about dependencies.
-    pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<SelectPlan> {
+    pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<Plan> {
         match &mut self.state {
             SubqueryState::Unevaluated { plan } => {
                 let outer_ref_ids = plan
                     .as_ref()
-                    .map(|plan| {
-                        plan.table_references
-                            .outer_query_refs()
-                            .iter()
-                            .filter(|t| t.is_used())
-                            .map(|t| t.internal_id)
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|plan| plan.used_outer_query_ref_ids())
                     .unwrap_or_default();
                 let plan = plan.take().unwrap();
                 self.state = SubqueryState::Evaluated {
@@ -2678,7 +2774,7 @@ pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
                     .any(|subquery| match &subquery.state {
                         SubqueryState::Unevaluated {
                             plan: Some(subquery_plan),
-                        } => select_plan_has_outer_scope_dependency(
+                        } => plan_has_outer_scope_dependency_with_tables(
                             subquery_plan,
                             accessible_table_ids,
                         ),

@@ -2,15 +2,10 @@ name: Nightly Benchmarks on Nyrkiö Runners (stability)
 
 on:
   workflow_dispatch:
-    branches: ["main", "notmain"]
-  schedule:
-    - cron: '24 4 * * *'
   push:
-  #   branches: ["main", "notmain", "master"]
-    branches: ["notmain"]
+    branches: ["turso-only"]
   pull_request:
-  #   branches: ["main", "notmain", "master"]
-    branches: ["notmain"]
+    branches: ["turso-only"]
 
 env:
   CARGO_TERM_COLOR: never

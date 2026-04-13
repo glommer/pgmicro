@@ -47,7 +47,7 @@ jobs:
           key: clippy-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: clippy-
           save-always: true
-      - run: cargo clippy --workspace --all-features --all-targets --locked -- --deny=warnings
+      - run: cargo clippy --workspace --all-features --all-targets --locked --exclude memory-benchmark -- --deny=warnings
 
   test-postgres:
     name: Postgres integration tests

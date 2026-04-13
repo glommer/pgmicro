@@ -15,6 +15,7 @@ workspace = true
 [features]
 default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
+pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
 sync = [
     "dep:hyper",
     "dep:tokio",
@@ -25,6 +26,7 @@ sync = [
 ]
 
 [dependencies]
+turso_core = { workspace = true }
 turso_sdk_kit = { workspace = true }
 turso_sync_sdk_kit = { workspace = true }
 thiserror = { workspace = true }

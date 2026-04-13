@@ -1,6 +1,6 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
-use crate::schema::{ColumnLayout, GeneratedType, Table};
+use crate::schema::{columns_affected_by_update, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::{
@@ -19,9 +19,10 @@ use crate::{
             UpdateRowSource,
         },
         expr::{
-            emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            NoConstantOptReason, ReturningBufferCtx,
+            emit_returning_results, emit_returning_scan_back, emit_table_column,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
+            ReturningBufferCtx,
         },
         fkeys::{
             emit_fk_child_update_counters, emit_fk_parent_new_key_reconcile,
@@ -899,7 +900,28 @@ fn emit_update_insns<'a>(
     let not_exists_check_required =
         has_user_provided_rowid || iteration_cursor_id != target_table_cursor_id;
 
-    let check_rowid_not_exists_label = if not_exists_check_required {
+    // Check early whether BEFORE UPDATE triggers exist, so we can defer NOT NULL
+    // constraint checks until after the triggers fire (matching SQLite behavior).
+    let update_database_id = target_table.database_id;
+    let has_before_triggers_early = if let Some(btree_table) = target_table.table.btree() {
+        let updated_column_indices: HashSet<usize> =
+            set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+        t_ctx.resolver.with_schema(update_database_id, |s| {
+            get_relevant_triggers_type_and_time(
+                s,
+                TriggerEvent::Update,
+                TriggerTime::Before,
+                Some(updated_column_indices),
+                &btree_table,
+            )
+            .next()
+            .is_some()
+        })
+    } else {
+        false
+    };
+
+    let check_rowid_not_exists_label = if not_exists_check_required || has_before_triggers_early {
         Some(program.allocate_label())
     } else {
         None
@@ -974,27 +996,6 @@ fn emit_update_insns<'a>(
     let start = if is_virtual { beg + 2 } else { beg + 1 };
     let layout = ColumnLayout::from_table(&target_table.as_ref().table);
     let skip_set_clauses = false;
-
-    // Check early whether BEFORE UPDATE triggers exist, so we can defer NOT NULL
-    // constraint checks until after the triggers fire (matching SQLite behavior).
-    let update_database_id = target_table.database_id;
-    let has_before_triggers_early = if let Some(btree_table) = target_table.table.btree() {
-        let updated_column_indices: HashSet<usize> =
-            set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        t_ctx.resolver.with_schema(update_database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices),
-                &btree_table,
-            )
-            .next()
-            .is_some()
-        })
-    } else {
-        false
-    };
 
     emit_update_column_values(
         program,
@@ -1085,20 +1086,23 @@ fn emit_update_insns<'a>(
         // Only read OLD row values when triggers or FK cascades need them
         let columns = target_table.table.columns();
         let old_registers: Option<Vec<usize>> = if needs_old_registers {
-            Some(
-                (0..col_len)
-                    .map(|i| {
-                        let reg = program.alloc_register();
-                        if columns[i].is_virtual_generated() {
-                            program.emit_null(reg, None);
-                        } else {
-                            program.emit_column_or_rowid(target_table_cursor_id, i, reg);
-                        }
-                        reg
-                    })
-                    .chain(std::iter::once(beg))
-                    .collect(),
-            )
+            let mut regs = Vec::with_capacity(col_len + 1);
+            for (i, column) in columns.iter().enumerate() {
+                let reg = program.alloc_register();
+                emit_table_column(
+                    program,
+                    target_table_cursor_id,
+                    internal_id,
+                    table_references,
+                    column,
+                    i,
+                    reg,
+                    &t_ctx.resolver,
+                )?;
+                regs.push(reg);
+            }
+            regs.push(beg);
+            Some(regs)
         } else {
             None
         };
@@ -1114,10 +1118,6 @@ fn emit_update_insns<'a>(
             // Compute virtual columns for NEW values
             let new_ctx = DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
             compute_virtual_columns(program, columns, &new_ctx, &t_ctx.resolver)?;
-
-            // Compute virtual columns for OLD values
-            let old_ctx = DmlColumnContext::indexed(columns.clone(), old_registers.clone());
-            compute_virtual_columns(program, columns, &old_ctx, &t_ctx.resolver)?;
 
             let new_registers = (0..col_len)
                 .map(|i| layout.to_register(start, i))
@@ -1464,16 +1464,15 @@ fn emit_update_insns<'a>(
         if !btree_table.check_constraints.is_empty() {
             // SQLite only evaluates CHECK constraints that reference at least one
             // column in the SET clause. Build a set of updated column names to filter.
-            let mut updated_col_names: HashSet<String> = set_clauses
-                .iter()
-                .filter_map(|(col_idx, _)| {
-                    btree_table
-                        .columns
-                        .get(*col_idx)
-                        .and_then(|c| c.name.as_deref())
-                        .map(normalize_ident)
-                })
-                .collect();
+            let mut updated_col_names: HashSet<String> = columns_affected_by_update(
+                &btree_table.columns,
+                &set_clauses.iter().map(|(idx, _)| *idx).collect(),
+            )
+            .iter()
+            .filter_map(|col_idx| btree_table.columns.get(*col_idx))
+            .filter_map(|col| col.name.as_deref())
+            .map(normalize_ident)
+            .collect();
 
             // If the rowid is being updated (either directly via ROWID_SENTINEL or
             // through a rowid alias column), also include the rowid pseudo-column

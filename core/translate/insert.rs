@@ -1,4 +1,5 @@
 use crate::schema::{ColumnLayout, GeneratedType};
+use crate::translate::optimizer::Optimizable;
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -458,6 +459,30 @@ pub fn translate_insert(
         init_autoincrement(program, &mut ctx, resolver)?;
     }
 
+    // For non-STRICT tables, apply column affinity to the values early.
+    // This must happen before BEFORE triggers (matching SQLite's order) so that
+    // trigger bodies see affinity-applied values. Affinity is idempotent, so
+    // applying it here means we can skip the per-trigger Copy+Affinity in fire_trigger.
+    if !ctx.table.is_strict {
+        let affinity = insertion
+            .col_mappings
+            .iter()
+            .filter(|cm| !cm.column.is_virtual_generated())
+            .map(|col_mapping| col_mapping.column.affinity());
+
+        // Only emit Affinity if there's meaningful affinity to apply
+        // (i.e., not all BLOB/NONE affinity)
+        if affinity.clone().any(|a| a != Affinity::Blob) {
+            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: insertion.first_col_register(),
+                    count,
+                    affinities: affinity.map(|a| a.aff_mask()).collect(),
+                });
+            }
+        }
+    }
+
     // Fire BEFORE INSERT triggers
 
     let relevant_before_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -473,7 +498,7 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        compute_virtual_columns_for_triggers(
+        compute_virtual_columns(
             program,
             &insertion.col_mappings,
             insertion.rowid_alias_mapping(),
@@ -627,29 +652,8 @@ pub fn translate_insert(
             check_generated: true,
             table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
         });
-    } else {
-        // For non-STRICT tables, apply column affinity to the values.
-        // This must happen early so that both index records and the table record
-        // use the converted values. SQLite does this with OP_Affinity before
-        // any index or constraint checks.
-        let affinity = insertion
-            .col_mappings
-            .iter()
-            .filter(|cm| !cm.column.is_virtual_generated())
-            .map(|col_mapping| col_mapping.column.affinity());
-
-        // Only emit Affinity if there's meaningful affinity to apply
-        // (i.e., not all BLOB/NONE affinity)
-        if affinity.clone().any(|a| a != Affinity::Blob) {
-            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
-                program.emit_insn(Insn::Affinity {
-                    start_reg: insertion.first_col_register(),
-                    count,
-                    affinities: affinity.map(|a| a.aff_mask()).collect(),
-                });
-            }
-        }
     }
+    // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
 
     // For AUTOINCREMENT tables with an explicit rowid, update sqlite_sequence
     // before CHECK constraints. SQLite updates sqlite_sequence even when
@@ -729,6 +733,16 @@ pub fn translate_insert(
         }
     }
 
+    // Make computed virtual columns accessible to CHECK and NOT NULL constraint evaluation
+    if insertion.has_virtual_columns() {
+        compute_virtual_columns(
+            program,
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+            resolver,
+        )?;
+    }
+
     // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
     emit_check_constraints(
         program,
@@ -799,17 +813,6 @@ pub fn translate_insert(
         connection,
         table_references: &mut table_references,
     };
-    // Compute virtual column values before NOT NULL constraint checking,
-    // so that things like `b AS (COALESCE(a, 0)) NOT NULL` pass validation.
-    if insertion.has_virtual_columns() {
-        compute_virtual_columns_for_triggers(
-            program,
-            &insertion.col_mappings,
-            insertion.rowid_alias_mapping(),
-            resolver,
-        )?;
-    }
-
     // NOT NULL default substitution must happen before index key registers are
     // copied in preflight constraint checks. Otherwise the index entry gets NULL
     // while the table row gets the default value, causing integrity_check failures.
@@ -896,7 +899,7 @@ pub fn translate_insert(
     });
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        compute_virtual_columns_for_triggers(
+        compute_virtual_columns(
             program,
             &insertion.col_mappings,
             insertion.rowid_alias_mapping(),
@@ -1860,13 +1863,12 @@ fn bind_insert(
                             for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
                                 match expr.as_mut() {
                                     Expr::Id(name) => {
-                                        if name.quoted_with('"') {
+                                        if name.quoted_with('"') && resolver.dqs_dml.is_enabled() {
                                             *expr = Expr::Literal(ast::Literal::String(
                                                 name.as_literal(),
                                             ))
                                             .into();
                                         } else {
-                                            // an INSERT INTO ... VALUES (...) cannot reference columns
                                             crate::bail_parse_error!("no such column: {name}");
                                         }
                                     }
@@ -1986,7 +1988,8 @@ fn init_source_emission<'a>(
         // If we had a single tuple in VALUES, it was inserted into the values vector parameter.
         if values.len() != required_column_count {
             crate::bail_parse_error!(
-                "{} values for {required_column_count} columns",
+                "table {} has {required_column_count} columns but {} values were supplied",
+                table.get_name(),
                 values.len()
             );
         }
@@ -2033,7 +2036,8 @@ fn init_source_emission<'a>(
                 })?;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(
-                        "{} values for {required_column_count} columns",
+                        "table {} has {required_column_count} columns but {} values were supplied",
+                        table.get_name(),
                         num_result_cols,
                     );
                 }
@@ -2621,6 +2625,14 @@ fn translate_column(
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
+    } else if matches!(
+        column.generated_type(),
+        GeneratedType::Virtual { resolved, .. } if resolved.is_constant(resolver)
+    ) {
+        // Constant virtual generated columns are hoisted to the program init
+        // section by translate_expr in compute_virtual_columns. Emitting NULL
+        // here would clobber the hoisted value before constraint checks
+        // (e.g. NOT NULL) and triggers read it.
     } else if column.hidden() || column.is_virtual_generated() {
         // Emit NULL for not-explicitly-mentioned hidden or virtual columns, even ignoring DEFAULT.
         program.emit_insn(Insn::Null {
@@ -2678,7 +2690,7 @@ fn self_table_ctx_from_col_mappings<'a>(
     SelfTableContext::ForDML(DmlColumnContext::indexed(columns, column_regs))
 }
 
-pub fn compute_virtual_columns_for_triggers<'a>(
+pub fn compute_virtual_columns<'a>(
     program: &mut ProgramBuilder,
     col_mappings: &[ColMapping<'a>],
     rowid_alias: Option<&ColMapping<'a>>,
@@ -2741,15 +2753,9 @@ fn emit_pk_uniqueness_check(
             });
             break 'emit_halt;
         }
-        if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
-            // IGNORE: skip this row entirely on PK conflict
-            program.emit_insn(Insn::Goto {
-                target_pc: ctx.loop_labels.row_done,
-            });
-            break 'emit_halt;
-        }
         if let Some(position) = position.or(upsert_catch_all) {
-            // PK conflict: the conflicting rowid is exactly the attempted key
+            // PK conflict: the conflicting rowid is exactly the attempted key.
+            // Upsert clause takes precedence over column-level ON CONFLICT.
             program.emit_insn(Insn::Copy {
                 src_reg: insertion.key_register(),
                 dst_reg: ctx.conflict_rowid_reg,
@@ -2757,6 +2763,13 @@ fn emit_pk_uniqueness_check(
             });
             program.emit_insn(Insn::Goto {
                 target_pc: preflight.upsert_actions[position].1,
+            });
+            break 'emit_halt;
+        }
+        if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            // IGNORE: skip this row entirely on PK conflict
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
             });
             break 'emit_halt;
         }
