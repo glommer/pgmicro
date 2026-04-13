@@ -1,12 +1,10 @@
-name: Build & publish pgmicro
+name: Build & test pgmicro
 
 on:
   workflow_dispatch:
   push:
     branches:
       - master
-    tags:
-      - pgmicro-v*
   pull_request:
     branches:
       - master
@@ -186,114 +184,3 @@ jobs:
           name: pgmicro-cli-${{ matrix.settings.target }}
           path: target/${{ matrix.settings.target }}/release-official/pgmicro
           if-no-files-found: error
-
-  package:
-    name: Package npm artifacts
-    if: startsWith(github.ref, 'refs/tags/pgmicro-v')
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs:
-      - build-napi
-      - build-cli
-      - test-napi
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      # Download all NAPI artifacts
-      - uses: actions/download-artifact@v4
-        with:
-          name: pgmicro-napi-aarch64-apple-darwin
-          path: npm/darwin-arm64/
-      - uses: actions/download-artifact@v4
-        with:
-          name: pgmicro-napi-x86_64-unknown-linux-gnu
-          path: npm/linux-x64-gnu/
-      - uses: actions/download-artifact@v4
-        with:
-          name: pgmicro-napi-aarch64-unknown-linux-gnu
-          path: npm/linux-arm64-gnu/
-
-      # Download all CLI artifacts
-      - uses: actions/download-artifact@v4
-        with:
-          name: pgmicro-cli-aarch64-apple-darwin
-          path: npm/darwin-arm64/
-      - uses: actions/download-artifact@v4
-        with:
-          name: pgmicro-cli-x86_64-unknown-linux-gnu
-          path: npm/linux-x64-gnu/
-      - uses: actions/download-artifact@v4
-        with:
-          name: pgmicro-cli-aarch64-unknown-linux-gnu
-          path: npm/linux-arm64-gnu/
-
-      - name: Make CLI binaries executable
-        run: |
-          chmod +x npm/darwin-arm64/pgmicro
-          chmod +x npm/linux-x64-gnu/pgmicro
-          chmod +x npm/linux-arm64-gnu/pgmicro
-
-      - name: Build TypeScript
-        working-directory: npm/pgmicro
-        run: |
-          npm install
-          npx tsc
-
-      - name: List package contents
-        run: |
-          echo "=== pgmicro (main) ==="
-          ls -la npm/pgmicro/dist/ || true
-          echo "=== darwin-arm64 ==="
-          ls -la npm/darwin-arm64/
-          echo "=== linux-x64-gnu ==="
-          ls -la npm/linux-x64-gnu/
-          echo "=== linux-arm64-gnu ==="
-          ls -la npm/linux-arm64-gnu/
-
-      - name: Dry-run npm pack
-        run: |
-          cd npm/pgmicro && npm pack --dry-run
-          cd ../darwin-arm64 && npm pack --dry-run
-          cd ../linux-x64-gnu && npm pack --dry-run
-          cd ../linux-arm64-gnu && npm pack --dry-run
-
-      - name: Upload packaged artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: pgmicro-npm-packages
-          path: |
-            npm/pgmicro/
-            npm/darwin-arm64/
-            npm/linux-x64-gnu/
-            npm/linux-arm64-gnu/
-
-  publish:
-    name: Publish to npm
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: startsWith(github.ref, 'refs/tags/pgmicro-v')
-    needs:
-      - package
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
-      - uses: actions/download-artifact@v4
-        with:
-          name: pgmicro-npm-packages
-          path: npm/
-      - name: Publish platform packages
-        run: |
-          cd npm/darwin-arm64 && npm publish --access public --provenance || true
-          cd ../linux-x64-gnu && npm publish --access public --provenance || true
-          cd ../linux-arm64-gnu && npm publish --access public --provenance || true
-      - name: Publish main package
-        run: cd npm/pgmicro && npm publish --access public --provenance
