@@ -177,7 +177,7 @@ jobs:
           restore-keys: pgmicro-cli-${{ matrix.settings.target }}-
           save-always: true
       - name: Build pgmicro CLI
-        run: cargo build --bin pgmicro --profile release-official --target ${{ matrix.settings.target }}
+        run: cargo build -p pgmicro --profile release-official --target ${{ matrix.settings.target }}
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
