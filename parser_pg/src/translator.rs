@@ -1251,6 +1251,8 @@ impl PostgreSQLTranslator {
 
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
+        let window_clause = self.translate_window_clause(&select.window_clause)?;
+
         let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
 
         let one_select = ast::OneSelect::Select {
@@ -1259,7 +1261,7 @@ impl PostgreSQLTranslator {
             from: from_clause,
             where_clause: where_clause.map(Box::new),
             group_by,
-            window_clause: vec![],
+            window_clause,
         };
 
         let select_body = ast::SelectBody {
@@ -1394,13 +1396,15 @@ impl PostgreSQLTranslator {
 
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
+        let window_clause = self.translate_window_clause(&select.window_clause)?;
+
         Ok(ast::OneSelect::Select {
             distinctness,
             columns: result_columns,
             from: from_clause,
             where_clause: where_clause.map(Box::new),
             group_by,
-            window_clause: vec![],
+            window_clause,
         })
     }
 
@@ -2689,10 +2693,69 @@ impl PostgreSQLTranslator {
         })
     }
 
+    /// Translate the WINDOW clause (named window definitions) from a SELECT statement.
+    fn translate_window_clause(
+        &self,
+        window_clause: &[pg_query::protobuf::Node],
+    ) -> Result<Vec<ast::WindowDef>, ParseError> {
+        use pg_query::protobuf::node::Node;
+
+        window_clause
+            .iter()
+            .map(|node| {
+                let wd = match &node.node {
+                    Some(Node::WindowDef(wd)) => wd,
+                    _ => {
+                        return Err(ParseError::ParseError(
+                            "WINDOW clause: expected WindowDef node".into(),
+                        ));
+                    }
+                };
+                let window = self.translate_window_spec(wd)?;
+                Ok(ast::WindowDef {
+                    name: ast::Name::from_string(&wd.name),
+                    window,
+                })
+            })
+            .collect()
+    }
+
+    /// Translate a WindowDef used as an OVER clause on a function call.
+    /// If the WindowDef is just a reference to a named window (OVER w),
+    /// returns Over::Name. Otherwise returns Over::Window with the full spec.
     fn translate_window_def(
         &self,
         window_def: &pg_query::protobuf::WindowDef,
     ) -> Result<ast::Over, ParseError> {
+        // When pg_query parses `OVER window_name`, the WindowDef has:
+        // - name = "window_name" (the referenced name)
+        // - partition_clause = []
+        // - order_clause = []
+        // If name is set and there's no inline spec, it's a reference.
+        if !window_def.name.is_empty()
+            && window_def.partition_clause.is_empty()
+            && window_def.order_clause.is_empty()
+        {
+            return Ok(ast::Over::Name(ast::Name::from_string(&window_def.name)));
+        }
+
+        let window = self.translate_window_spec(window_def)?;
+        Ok(ast::Over::Window(window))
+    }
+
+    /// Translate a WindowDef protobuf into an ast::Window (shared by both
+    /// WINDOW clause definitions and inline OVER specifications).
+    fn translate_window_spec(
+        &self,
+        window_def: &pg_query::protobuf::WindowDef,
+    ) -> Result<ast::Window, ParseError> {
+        // Base window reference (for window inheritance)
+        let base = if !window_def.refname.is_empty() {
+            Some(ast::Name::from_string(&window_def.refname))
+        } else {
+            None
+        };
+
         // PARTITION BY
         let partition_by: Vec<Box<ast::Expr>> = window_def
             .partition_clause
@@ -2710,12 +2773,12 @@ impl PostgreSQLTranslator {
             &window_def.end_offset,
         )?;
 
-        Ok(ast::Over::Window(ast::Window {
-            base: None,
+        Ok(ast::Window {
+            base,
             partition_by,
             order_by,
             frame_clause,
-        }))
+        })
     }
 
     fn translate_frame_options(
@@ -5791,5 +5854,148 @@ mod tests {
         // if it encounters it — it falls to the catch-all arm.
         // For this test, just verify parsing succeeds.
         assert!(!parsed.protobuf.nodes().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Named windows
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_named_window_basic() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT SUM(x) OVER w FROM t WINDOW w AS (PARTITION BY y)";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select {
+                window_clause,
+                columns,
+                ..
+            } = &select.body.select
+            {
+                // WINDOW clause should have one definition
+                assert_eq!(window_clause.len(), 1);
+                assert_eq!(window_clause[0].name.as_str(), "w");
+                assert_eq!(window_clause[0].window.partition_by.len(), 1);
+                assert!(window_clause[0].window.order_by.is_empty());
+
+                // The function should reference the named window
+                if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
+                    if let ast::Expr::FunctionCall { filter_over, .. } = &**expr {
+                        assert!(
+                            matches!(&filter_over.over_clause, Some(ast::Over::Name(n)) if n.as_str() == "w"),
+                            "Expected Over::Name(\"w\"), got: {:?}",
+                            filter_over.over_clause
+                        );
+                    } else {
+                        panic!("Expected FunctionCall");
+                    }
+                }
+            } else {
+                panic!("Expected Select");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn test_named_window_with_order_by() {
+        let translator = PostgreSQLTranslator::new();
+        let sql =
+            "SELECT ROW_NUMBER() OVER w FROM t WINDOW w AS (PARTITION BY dept ORDER BY salary)";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { window_clause, .. } = &select.body.select {
+                assert_eq!(window_clause.len(), 1);
+                assert_eq!(window_clause[0].name.as_str(), "w");
+                assert_eq!(window_clause[0].window.partition_by.len(), 1);
+                assert_eq!(window_clause[0].window.order_by.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_multiple_named_windows() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT SUM(x) OVER w1, AVG(x) OVER w2 FROM t \
+                   WINDOW w1 AS (PARTITION BY a), w2 AS (ORDER BY b)";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { window_clause, .. } = &select.body.select {
+                assert_eq!(window_clause.len(), 2);
+                assert_eq!(window_clause[0].name.as_str(), "w1");
+                assert_eq!(window_clause[0].window.partition_by.len(), 1);
+                assert!(window_clause[0].window.order_by.is_empty());
+                assert_eq!(window_clause[1].name.as_str(), "w2");
+                assert!(window_clause[1].window.partition_by.is_empty());
+                assert_eq!(window_clause[1].window.order_by.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_named_window_with_frame() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT SUM(x) OVER w FROM t \
+                   WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { window_clause, .. } = &select.body.select {
+                assert_eq!(window_clause.len(), 1);
+                assert!(window_clause[0].window.frame_clause.is_some());
+                let frame = window_clause[0].window.frame_clause.as_ref().unwrap();
+                assert_eq!(frame.mode, ast::FrameMode::Rows);
+            }
+        }
+    }
+
+    #[test]
+    fn test_named_window_inheritance() {
+        let translator = PostgreSQLTranslator::new();
+        // w2 inherits from w1 and adds ORDER BY
+        let sql = "SELECT SUM(x) OVER w2 FROM t \
+                   WINDOW w1 AS (PARTITION BY dept), w2 AS (w1 ORDER BY salary)";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { window_clause, .. } = &select.body.select {
+                assert_eq!(window_clause.len(), 2);
+                // w1 has no base
+                assert!(window_clause[0].window.base.is_none());
+                // w2 inherits from w1
+                assert_eq!(
+                    window_clause[1].window.base.as_ref().map(|n| n.as_str()),
+                    Some("w1")
+                );
+                assert_eq!(window_clause[1].window.order_by.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_named_window_empty_over() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT COUNT(*) OVER w FROM t WINDOW w AS ()";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { window_clause, .. } = &select.body.select {
+                assert_eq!(window_clause.len(), 1);
+                assert_eq!(window_clause[0].name.as_str(), "w");
+                assert!(window_clause[0].window.partition_by.is_empty());
+                assert!(window_clause[0].window.order_by.is_empty());
+                assert!(window_clause[0].window.frame_clause.is_none());
+            }
+        }
     }
 }

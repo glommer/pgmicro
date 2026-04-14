@@ -721,3 +721,84 @@ fn refresh_materialized_view_is_noop() {
     let out = stdout(&output);
     assert!(out.contains("ok"), "REFRESH should be a no-op: {out}");
 }
+
+// ---------------------------------------------------------------------------
+// Named windows (WINDOW clause)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn named_window_basic() {
+    let output = run_pgmicro(
+        b"CREATE TABLE emp(id INT, dept TEXT, salary INT);\n\
+          INSERT INTO emp VALUES (1, 'eng', 100), (2, 'eng', 200), (3, 'sales', 150);\n\
+          SELECT dept, salary, SUM(salary) OVER w FROM emp WINDOW w AS (PARTITION BY dept);\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // eng partition total = 300
+    assert!(out.contains("300"), "expected window sum 300, got: {out}");
+    // sales partition total = 150
+    assert!(out.contains("150"), "expected window sum 150, got: {out}");
+}
+
+#[test]
+fn named_window_row_number() {
+    let output = run_pgmicro(
+        b"CREATE TABLE items(id INT, name TEXT);\n\
+          INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c');\n\
+          SELECT name, ROW_NUMBER() OVER w FROM items WINDOW w AS (ORDER BY id);\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("1"), "expected row_number 1, got: {out}");
+    assert!(out.contains("2"), "expected row_number 2, got: {out}");
+    assert!(out.contains("3"), "expected row_number 3, got: {out}");
+}
+
+#[test]
+fn named_window_multiple_functions_same_window() {
+    let output = run_pgmicro(
+        b"CREATE TABLE vals(x INT);\n\
+          INSERT INTO vals VALUES (10), (20), (30);\n\
+          SELECT x, SUM(x) OVER w, AVG(x) OVER w FROM vals WINDOW w AS (ORDER BY x);\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // Running sums: 10, 30, 60
+    assert!(out.contains("10"), "expected running sum 10, got: {out}");
+    assert!(out.contains("30"), "expected running sum 30, got: {out}");
+    assert!(out.contains("60"), "expected running sum 60, got: {out}");
+}
+
+#[test]
+fn named_window_multiple_definitions() {
+    let output = run_pgmicro(
+        b"CREATE TABLE data(grp TEXT, val INT);\n\
+          INSERT INTO data VALUES ('a', 1), ('a', 2), ('b', 3);\n\
+          SELECT grp, SUM(val) OVER w1, COUNT(*) OVER w2 \
+          FROM data \
+          WINDOW w1 AS (PARTITION BY grp), w2 AS ();\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // w1 partitioned sums: a=3, b=3
+    assert!(out.contains("3"), "expected partition sum, got: {out}");
+    // w2 unpartitioned count = 3 for all rows
+    assert!(out.contains("3"), "expected total count 3, got: {out}");
+}
+
+#[test]
+fn named_window_running_total() {
+    // ORDER BY in a named window produces a running total (default RANGE UNBOUNDED PRECEDING)
+    let output = run_pgmicro(
+        b"CREATE TABLE seq(id INT, val INT);\n\
+          INSERT INTO seq VALUES (1, 10), (2, 20), (3, 30);\n\
+          SELECT id, SUM(val) OVER w FROM seq WINDOW w AS (ORDER BY id);\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // Running totals: 10, 30, 60
+    assert!(out.contains("10"), "expected running total 10, got: {out}");
+    assert!(out.contains("30"), "expected running total 30, got: {out}");
+    assert!(out.contains("60"), "expected running total 60, got: {out}");
+}

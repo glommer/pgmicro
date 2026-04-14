@@ -21,7 +21,7 @@ Sorted by implementation difficulty.
 
 10. **Transaction isolation levels** — parse BEGIN ISOLATION LEVEL, map to pragmas or ignore (SQLite has limited isolation)
 11. **EXPLAIN** — Turso has EXPLAIN; just need to pass through the PG EXPLAIN node
-12. **Named windows** (`WINDOW w AS (...)` then `OVER w`) — resolve window references during translation
+12. ~~**Named windows**~~ — DONE (WINDOW clause + OVER name references + window inheritance)
 13. ~~**CREATE MATERIALIZED VIEW**~~ — DONE (uses Turso's live incremental materialized views)
 
 ## Hard (a week+)
