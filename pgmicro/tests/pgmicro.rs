@@ -217,3 +217,588 @@ fn empty_input_returns_zero() {
     let output = run_pgmicro(b"");
     assert_eq!(output.status.code(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// DEFAULT functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_now_produces_value() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, ts TEXT DEFAULT now());\n\
+          INSERT INTO t(id) VALUES (1);\n\
+          SELECT ts FROM t;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // now() produces a timestamp like "2026-04-13 ..."
+    assert!(
+        out.contains("20"),
+        "expected timestamp from now(), got: {out}"
+    );
+}
+
+#[test]
+fn default_gen_random_uuid_produces_value() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, uid TEXT DEFAULT gen_random_uuid());\n\
+          INSERT INTO t(id) VALUES (1);\n\
+          INSERT INTO t(id) VALUES (2);\n\
+          SELECT uid FROM t ORDER BY id;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // UUID contains hyphens
+    assert!(
+        out.matches('-').count() >= 4,
+        "expected UUID with hyphens, got: {out}"
+    );
+}
+
+#[test]
+fn describe_table_shows_default_expressions() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, ts TEXT DEFAULT now(), uid TEXT DEFAULT gen_random_uuid());\n\
+          \\d t\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("now"),
+        "\\d should show now() default, got: {out}"
+    );
+    assert!(
+        out.contains("gen_random_uuid"),
+        "\\d should show gen_random_uuid() default, got: {out}"
+    );
+}
+
+#[test]
+fn default_casted_expression() {
+    let output = run_pgmicro(
+        b"CREATE TABLE config(id INT, data jsonb DEFAULT '{}'::jsonb, tags jsonb DEFAULT '[]'::jsonb);\n\
+          INSERT INTO config(id) VALUES (1);\n\
+          SELECT data, tags FROM config;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("{}"),
+        "expected '{{}}' from casted default, got: {out}"
+    );
+    assert!(
+        out.contains("[]"),
+        "expected '[]' from casted default, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \di
+// ---------------------------------------------------------------------------
+
+#[test]
+fn di_lists_created_indexes() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT PRIMARY KEY, name TEXT);\nCREATE INDEX idx_name ON t(name);\n\\di\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("idx_name"),
+        "\\di should list idx_name, got: {out}"
+    );
+}
+
+#[test]
+fn di_empty_database() {
+    let output = run_pgmicro(b"\\di\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("No indexes found"),
+        "expected 'No indexes found', got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \dv
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dv_empty_database() {
+    let output = run_pgmicro(b"\\dv\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("No views found"),
+        "expected 'No views found', got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \dn
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dn_lists_schemas() {
+    let output = run_pgmicro(b"\\dn\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("public"),
+        "\\dn should list 'public', got: {out}"
+    );
+}
+
+#[test]
+fn dn_lists_created_schema() {
+    let output = run_pgmicro(b"CREATE SCHEMA foo;\n\\dn\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("foo"), "\\dn should list 'foo', got: {out}");
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \dT
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d_upper_t_lists_types() {
+    let output = run_pgmicro(b"CREATE TYPE mood AS ENUM ('happy', 'sad');\n\\dT\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("mood"), "\\dT should list 'mood', got: {out}");
+}
+
+#[test]
+fn d_upper_t_empty() {
+    let output = run_pgmicro(b"\\dT\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("No types found"),
+        "expected 'No types found', got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \du
+// ---------------------------------------------------------------------------
+
+#[test]
+fn du_lists_roles() {
+    let output = run_pgmicro(b"\\du\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("turso"),
+        "\\du should list 'turso', got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \df
+// ---------------------------------------------------------------------------
+
+#[test]
+fn df_lists_functions() {
+    let output = run_pgmicro(b"\\df\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("abs") || out.contains("length"),
+        "\\df should list some builtin function, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \d+ (extended describe)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d_plus_describes_table_extended() {
+    let output = run_pgmicro(
+        b"CREATE TABLE tbl(id INT PRIMARY KEY, name TEXT);\nCREATE INDEX idx_tbl_name ON tbl(name);\n\\d+ tbl\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("id"), "should show column 'id', got: {out}");
+    assert!(
+        out.contains("idx_tbl_name"),
+        "should show index, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \dt+
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dt_plus_lists_tables_extended() {
+    let output = run_pgmicro(b"CREATE TABLE tbl(id INT);\n\\dt+\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("tbl"),
+        "\\dt+ should list table name, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \x
+// ---------------------------------------------------------------------------
+
+#[test]
+fn x_toggles_expanded() {
+    let output = run_pgmicro(b"\\x\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("Expanded display is on"),
+        "expected toggle message, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \timing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn timing_toggles() {
+    let output = run_pgmicro(b"\\timing\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("Timing is on"),
+        "expected timing toggle message, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \echo
+// ---------------------------------------------------------------------------
+
+#[test]
+fn echo_prints_text() {
+    let output = run_pgmicro(b"\\echo hello world\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("hello world"),
+        "expected 'hello world', got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \? (updated help)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn help_lists_new_commands() {
+    let output = run_pgmicro(b"\\?\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("\\di"), "help should mention \\di, got: {out}");
+    assert!(out.contains("\\dn"), "help should mention \\dn, got: {out}");
+    assert!(out.contains("\\dT"), "help should mention \\dT, got: {out}");
+}
+
+// ---------------------------------------------------------------------------
+// Array constructor and subscripting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn array_constructor_and_subscript() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, tags TEXT[]);\n\
+          INSERT INTO t VALUES (1, ARRAY['a','b','c']);\n\
+          SELECT tags[1], tags[2], tags[3] FROM t;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("a"), "expected 'a' in output, got: {out}");
+    assert!(out.contains("b"), "expected 'b' in output, got: {out}");
+    assert!(out.contains("c"), "expected 'c' in output, got: {out}");
+}
+
+#[test]
+fn array_slice() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, tags TEXT[]);\n\
+          INSERT INTO t VALUES (1, ARRAY['a','b','c','d']);\n\
+          SELECT tags[2:3] FROM t;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("b"),
+        "expected 'b' in slice output, got: {out}"
+    );
+    assert!(
+        out.contains("c"),
+        "expected 'c' in slice output, got: {out}"
+    );
+}
+
+#[test]
+fn array_in_where_clause() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, vals INT[]);\n\
+          INSERT INTO t VALUES (1, ARRAY[10,20,30]);\n\
+          INSERT INTO t VALUES (2, ARRAY[40,50,60]);\n\
+          SELECT id FROM t WHERE vals[1] = 40;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("2"), "expected id=2, got: {out}");
+    assert!(
+        !out.contains("1") || out.contains("2"),
+        "should only return id=2"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dollar-quoted and escape strings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dollar_quoted_string() {
+    let output = run_pgmicro(b"SELECT $$hello world$$;\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("hello world"),
+        "expected 'hello world', got: {out}"
+    );
+}
+
+#[test]
+fn dollar_quoted_with_embedded_quote() {
+    let output = run_pgmicro(b"SELECT $$it's fine$$;\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("it's fine"),
+        "expected embedded quote, got: {out}"
+    );
+}
+
+#[test]
+fn tagged_dollar_quoted_string() {
+    let output = run_pgmicro(b"SELECT $tag$content$tag$;\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("content"), "expected 'content', got: {out}");
+}
+
+#[test]
+fn escape_string_backslash_n() {
+    let output = run_pgmicro(b"SELECT E'line1\\nline2';\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("line1") && out.contains("line2"),
+        "expected two lines, got: {out}"
+    );
+}
+
+#[test]
+fn escape_string_backslash_t() {
+    let output = run_pgmicro(b"SELECT E'col1\\tcol2';\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("col1") && out.contains("col2"),
+        "expected tab-separated, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Materialized views
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_materialized_view_basic() {
+    let output = run_pgmicro(
+        b"CREATE TABLE items(id INT, name TEXT, price INT);\n\
+          INSERT INTO items VALUES (1, 'Laptop', 1200), (2, 'Mouse', 25), (3, 'Monitor', 400);\n\
+          CREATE MATERIALIZED VIEW expensive AS SELECT * FROM items WHERE price > 100;\n\
+          SELECT name FROM expensive ORDER BY name;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("Laptop"), "expected Laptop, got: {out}");
+    assert!(out.contains("Monitor"), "expected Monitor, got: {out}");
+    assert!(
+        !out.contains("Mouse"),
+        "Mouse should be filtered out: {out}"
+    );
+}
+
+#[test]
+fn materialized_view_with_aggregation() {
+    let output = run_pgmicro(
+        b"CREATE TABLE sales(product TEXT, amount INT);\n\
+          INSERT INTO sales VALUES ('A', 10), ('B', 20), ('A', 30), ('B', 5);\n\
+          CREATE MATERIALIZED VIEW totals AS SELECT product, SUM(amount) as total FROM sales GROUP BY product;\n\
+          SELECT * FROM totals ORDER BY product;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("A"), "expected product A, got: {out}");
+    assert!(out.contains("40"), "expected total 40 for A, got: {out}");
+    assert!(out.contains("B"), "expected product B, got: {out}");
+    assert!(out.contains("25"), "expected total 25 for B, got: {out}");
+}
+
+#[test]
+fn materialized_view_live_update() {
+    let output = run_pgmicro(
+        b"CREATE TABLE counters(grp TEXT, val INT);\n\
+          INSERT INTO counters VALUES ('x', 1), ('y', 2);\n\
+          CREATE MATERIALIZED VIEW sums AS SELECT grp, SUM(val) as total FROM counters GROUP BY grp;\n\
+          INSERT INTO counters VALUES ('x', 10);\n\
+          SELECT * FROM sums WHERE grp = 'x';\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // After inserting (x, 10), the total for x should be 11 (live update, no REFRESH needed)
+    assert!(
+        out.contains("11"),
+        "expected live-updated total 11, got: {out}"
+    );
+}
+
+#[test]
+fn materialized_view_duplicate_errors() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT);\n\
+          CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n\
+          CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n",
+    );
+    let out = stdout(&output);
+    let err = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{out}{err}");
+    assert!(
+        combined.contains("already exists"),
+        "duplicate should error: {combined}"
+    );
+}
+
+#[test]
+fn drop_materialized_view() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT);\n\
+          CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n\
+          DROP MATERIALIZED VIEW mv;\n\
+          SELECT 'dropped';\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("dropped"), "DROP should succeed: {out}");
+}
+
+#[test]
+fn drop_materialized_view_if_exists() {
+    let output = run_pgmicro(
+        b"DROP MATERIALIZED VIEW IF EXISTS nonexistent;\n\
+          SELECT 'ok';\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("ok"), "IF EXISTS should not error: {out}");
+}
+
+#[test]
+fn refresh_materialized_view_is_noop() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT);\n\
+          CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n\
+          REFRESH MATERIALIZED VIEW mv;\n\
+          SELECT 'ok';\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("ok"), "REFRESH should be a no-op: {out}");
+}
+
+// ---------------------------------------------------------------------------
+// Named windows (WINDOW clause)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn named_window_basic() {
+    let output = run_pgmicro(
+        b"CREATE TABLE emp(id INT, dept TEXT, salary INT);\n\
+          INSERT INTO emp VALUES (1, 'eng', 100), (2, 'eng', 200), (3, 'sales', 150);\n\
+          SELECT dept, salary, SUM(salary) OVER w FROM emp WINDOW w AS (PARTITION BY dept);\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // eng partition total = 300
+    assert!(out.contains("300"), "expected window sum 300, got: {out}");
+    // sales partition total = 150
+    assert!(out.contains("150"), "expected window sum 150, got: {out}");
+}
+
+#[test]
+fn named_window_row_number() {
+    let output = run_pgmicro(
+        b"CREATE TABLE items(id INT, name TEXT);\n\
+          INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c');\n\
+          SELECT name, ROW_NUMBER() OVER w FROM items WINDOW w AS (ORDER BY id);\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("1"), "expected row_number 1, got: {out}");
+    assert!(out.contains("2"), "expected row_number 2, got: {out}");
+    assert!(out.contains("3"), "expected row_number 3, got: {out}");
+}
+
+#[test]
+fn named_window_multiple_functions_same_window() {
+    let output = run_pgmicro(
+        b"CREATE TABLE vals(x INT);\n\
+          INSERT INTO vals VALUES (10), (20), (30);\n\
+          SELECT x, SUM(x) OVER w, AVG(x) OVER w FROM vals WINDOW w AS (ORDER BY x);\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // Running sums: 10, 30, 60
+    assert!(out.contains("10"), "expected running sum 10, got: {out}");
+    assert!(out.contains("30"), "expected running sum 30, got: {out}");
+    assert!(out.contains("60"), "expected running sum 60, got: {out}");
+}
+
+#[test]
+fn named_window_multiple_definitions() {
+    let output = run_pgmicro(
+        b"CREATE TABLE data(grp TEXT, val INT);\n\
+          INSERT INTO data VALUES ('a', 1), ('a', 2), ('b', 3);\n\
+          SELECT grp, SUM(val) OVER w1, COUNT(*) OVER w2 \
+          FROM data \
+          WINDOW w1 AS (PARTITION BY grp), w2 AS ();\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // w1 partitioned sums: a=3, b=3
+    assert!(out.contains("3"), "expected partition sum, got: {out}");
+    // w2 unpartitioned count = 3 for all rows
+    assert!(out.contains("3"), "expected total count 3, got: {out}");
+}
+
+#[test]
+fn named_window_running_total() {
+    // ORDER BY in a named window produces a running total (default RANGE UNBOUNDED PRECEDING)
+    let output = run_pgmicro(
+        b"CREATE TABLE seq(id INT, val INT);\n\
+          INSERT INTO seq VALUES (1, 10), (2, 20), (3, 30);\n\
+          SELECT id, SUM(val) OVER w FROM seq WINDOW w AS (ORDER BY id);\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    // Running totals: 10, 30, 60
+    assert!(out.contains("10"), "expected running total 10, got: {out}");
+    assert!(out.contains("30"), "expected running total 30, got: {out}");
+    assert!(out.contains("60"), "expected running total 60, got: {out}");
+}

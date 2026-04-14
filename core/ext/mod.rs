@@ -229,6 +229,7 @@ impl Database {
         #[cfg(feature = "time")]
         crate::time::register_extension(&mut ext_api);
         crate::regexp::register_extension(&mut ext_api);
+        crate::functions::postgres::register_pg_functions(&mut ext_api);
         #[cfg(feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;

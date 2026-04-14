@@ -851,6 +851,7 @@ fn validate(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
     resolver: &Resolver,
@@ -859,6 +860,7 @@ pub fn translate_create_table(
     body: ast::CreateTableBody,
     program: &mut ProgramBuilder,
     connection: &Connection,
+    input: &str,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(&tbl_name)?;
     if crate::is_attached_db(database_id) {
@@ -1003,7 +1005,10 @@ pub fn translate_create_table(
         false
     };
 
-    let sql = create_table_body_to_str(&tbl_name, &body)?;
+    let sql = connection
+        .get_sql_dialect()
+        .handler()
+        .format_schema_sql(input, &tbl_name, &body)?;
 
     let parse_schema_label = program.allocate_label();
     // TODO: ReadCookie
@@ -1271,25 +1276,6 @@ fn collect_autoindexes(
     } else {
         Ok(Some(regs))
     }
-}
-
-fn create_table_body_to_str(
-    tbl_name: &ast::QualifiedName,
-    body: &ast::CreateTableBody,
-) -> crate::Result<String> {
-    let mut sql = String::new();
-    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body).as_str());
-    match body {
-        ast::CreateTableBody::ColumnsAndConstraints {
-            columns: _,
-            constraints: _,
-            options: _,
-        } => {}
-        ast::CreateTableBody::AsSelect(_select) => {
-            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
-        }
-    }
-    Ok(sql)
 }
 
 fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {

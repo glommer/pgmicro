@@ -1906,6 +1906,41 @@ fn test_postgres_enum_label_with_spaces(db: TempDatabase) {
     assert_eq!(rows.row().unwrap().get_value(0).to_string(), "sign up");
 }
 
+#[turso_macros::test(mvcc)]
+fn test_postgres_drop_type(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TYPE mood AS ENUM ('happy', 'sad')")
+        .unwrap();
+    conn.execute("CREATE TABLE people (name TEXT, m mood)")
+        .unwrap();
+    conn.execute("INSERT INTO people VALUES ('Alice', 'happy')")
+        .unwrap();
+
+    // Drop the table first (type is in use)
+    conn.execute("DROP TABLE people").unwrap();
+    conn.execute("DROP TYPE mood").unwrap();
+
+    // Type should no longer exist — creating a table with it should fail
+    let result = conn.execute("CREATE TABLE people2 (name TEXT, m mood)");
+    assert!(result.is_err(), "expected error using dropped type");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_drop_type_if_exists(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    // Should not error on nonexistent type
+    conn.execute("DROP TYPE IF EXISTS nonexistent").unwrap();
+
+    // Create then drop
+    conn.execute("CREATE TYPE color AS ENUM ('red', 'blue')")
+        .unwrap();
+    conn.execute("DROP TYPE IF EXISTS color").unwrap();
+}
+
 #[turso_macros::test]
 fn test_postgres_similar_to(db: TempDatabase) {
     let conn = db.connect_limbo();
@@ -2502,4 +2537,279 @@ fn test_postgres_compound_three_way_order_by(db: TempDatabase) {
         }
     }
     assert_eq!(results, vec![5, 4, 3, 2, 1]);
+}
+
+/// Tests DEFAULT now() produces a valid timestamp string.
+#[turso_macros::test]
+fn test_postgres_default_now(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+    conn.execute(
+        "CREATE TABLE events (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT DEFAULT now()
+        )",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO events (id) VALUES (1)").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT created_at FROM events WHERE id = 1")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(ts) = row.get_value(0) else {
+        panic!(
+            "expected text value for created_at, got {:?}",
+            row.get_value(0)
+        );
+    };
+    // Should be a timestamp like "2024-01-15 14:30:45.123"
+    assert!(ts.value.len() >= 19, "timestamp too short: '{}'", ts.value);
+    assert!(
+        ts.value.contains('-') && ts.value.contains(':'),
+        "timestamp format wrong: '{}'",
+        ts.value
+    );
+}
+
+/// Tests DEFAULT gen_random_uuid() produces a valid UUID string.
+#[turso_macros::test]
+fn test_postgres_default_gen_random_uuid(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+    conn.execute(
+        "CREATE TABLE tokens (
+            id INTEGER PRIMARY KEY,
+            token TEXT DEFAULT gen_random_uuid()
+        )",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO tokens (id) VALUES (1)").unwrap();
+    conn.execute("INSERT INTO tokens (id) VALUES (2)").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT token FROM tokens ORDER BY id")
+        .unwrap();
+    let mut uuids: Vec<String> = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let Value::Text(t) = row.get_value(0) else {
+                    panic!("expected text value for token");
+                };
+                uuids.push(t.value.to_string());
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert_eq!(uuids.len(), 2);
+    // UUID v4 format: 8-4-4-4-12 hex chars
+    for uuid in &uuids {
+        let parts: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(parts.len(), 5, "UUID format wrong: '{uuid}'");
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert_eq!(parts[3].len(), 4);
+        assert_eq!(parts[4].len(), 12);
+    }
+    // Two inserts should produce different UUIDs
+    assert_ne!(uuids[0], uuids[1]);
+}
+
+/// Tests DEFAULT clock_timestamp() works as a PG timestamp alias.
+#[turso_macros::test]
+fn test_postgres_default_clock_timestamp(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+    conn.execute(
+        "CREATE TABLE logs (
+            id INTEGER PRIMARY KEY,
+            ts TEXT DEFAULT clock_timestamp()
+        )",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO logs (id) VALUES (1)").unwrap();
+
+    let mut stmt = conn.prepare("SELECT ts FROM logs WHERE id = 1").unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(ts) = row.get_value(0) else {
+        panic!("expected text value for ts");
+    };
+    assert!(ts.value.len() >= 19, "timestamp too short: '{}'", ts.value);
+}
+
+/// Tests DEFAULT transaction_timestamp() and statement_timestamp() work.
+#[turso_macros::test]
+fn test_postgres_default_transaction_and_statement_timestamp(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+    conn.execute(
+        "CREATE TABLE audit (
+            id INTEGER PRIMARY KEY,
+            txn_ts TEXT DEFAULT transaction_timestamp(),
+            stmt_ts TEXT DEFAULT statement_timestamp()
+        )",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO audit (id) VALUES (1)").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT txn_ts, stmt_ts FROM audit WHERE id = 1")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(txn_ts) = row.get_value(0) else {
+        panic!("expected text for txn_ts");
+    };
+    let Value::Text(stmt_ts) = row.get_value(1) else {
+        panic!("expected text for stmt_ts");
+    };
+    // Both should be valid timestamps
+    assert!(txn_ts.value.len() >= 19);
+    assert!(stmt_ts.value.len() >= 19);
+}
+
+/// Tests that now() and gen_random_uuid() also work in SELECT (not just DEFAULT).
+#[turso_macros::test]
+fn test_postgres_select_now_and_uuid(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    // SELECT now()
+    let mut stmt = conn.prepare("SELECT now()").unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(ts) = row.get_value(0) else {
+        panic!("expected text from now()");
+    };
+    assert!(
+        ts.value.len() >= 19,
+        "now() result too short: '{}'",
+        ts.value
+    );
+    drop(stmt);
+
+    // SELECT gen_random_uuid()
+    let mut stmt = conn.prepare("SELECT gen_random_uuid()").unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(uuid) = row.get_value(0) else {
+        panic!("expected text from gen_random_uuid()");
+    };
+    assert_eq!(
+        uuid.value.split('-').count(),
+        5,
+        "UUID format wrong: '{}'",
+        uuid.value
+    );
+}
+
+/// Tests multiple DEFAULT functions in the same table.
+#[turso_macros::test]
+fn test_postgres_default_multiple_functions(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+    conn.execute(
+        "CREATE TABLE records (
+            id INTEGER PRIMARY KEY,
+            uuid TEXT DEFAULT gen_random_uuid(),
+            created TEXT DEFAULT now(),
+            status TEXT DEFAULT 'active'
+        )",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO records (id) VALUES (1)").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT uuid, created, status FROM records WHERE id = 1")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = stmt.row().unwrap();
+
+    // uuid should be a valid UUID
+    let Value::Text(uuid) = row.get_value(0) else {
+        panic!("expected text for uuid");
+    };
+    assert_eq!(uuid.value.split('-').count(), 5);
+
+    // created should be a timestamp
+    let Value::Text(created) = row.get_value(1) else {
+        panic!("expected text for created");
+    };
+    assert!(created.value.len() >= 19);
+
+    // status should be the literal default
+    let Value::Text(status) = row.get_value(2) else {
+        panic!("expected text for status");
+    };
+    assert_eq!(status.value, "active");
+}
+
+/// Tests DEFAULT with type cast syntax (e.g. '{}'::jsonb).
+#[turso_macros::test]
+fn test_postgres_default_casted_expression(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+    conn.execute(
+        "CREATE TABLE config (
+            id INTEGER PRIMARY KEY,
+            data jsonb DEFAULT '{}'::jsonb,
+            tags jsonb DEFAULT '[]'::jsonb,
+            name TEXT DEFAULT 'unnamed'
+        )",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO config (id) VALUES (1)").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT data, tags, name FROM config WHERE id = 1")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = stmt.row().unwrap();
+
+    let Value::Text(data) = row.get_value(0) else {
+        panic!("expected text for data, got {:?}", row.get_value(0));
+    };
+    assert_eq!(
+        data.value, "{}",
+        "casted default '{{}}'::jsonb should produce '{{}}'"
+    );
+
+    let Value::Text(tags) = row.get_value(1) else {
+        panic!("expected text for tags, got {:?}", row.get_value(1));
+    };
+    assert_eq!(
+        tags.value, "[]",
+        "casted default '[]'::jsonb should produce '[]'"
+    );
+
+    let Value::Text(name) = row.get_value(2) else {
+        panic!("expected text for name, got {:?}", row.get_value(2));
+    };
+    assert_eq!(name.value, "unnamed");
 }

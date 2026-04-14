@@ -41,6 +41,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -178,8 +179,19 @@ fn init_tracing(opts: &Opts) -> Result<WorkerGuard, std::io::Error> {
 fn cmd_help(w: &mut dyn Write) {
     let _ = writeln!(w, "Meta-commands:");
     let _ = writeln!(w, "  \\dt            List tables");
+    let _ = writeln!(w, "  \\dt+           List tables (extended)");
     let _ = writeln!(w, "  \\d <table>     Describe table columns");
+    let _ = writeln!(w, "  \\d+ <table>    Describe table (extended)");
+    let _ = writeln!(w, "  \\di            List indexes");
+    let _ = writeln!(w, "  \\dv            List views");
+    let _ = writeln!(w, "  \\dn            List schemas");
+    let _ = writeln!(w, "  \\dT            List types");
+    let _ = writeln!(w, "  \\du            List roles");
+    let _ = writeln!(w, "  \\df            List functions");
     let _ = writeln!(w, "  \\l             List databases");
+    let _ = writeln!(w, "  \\x             Toggle expanded display");
+    let _ = writeln!(w, "  \\timing        Toggle query timing");
+    let _ = writeln!(w, "  \\echo <text>   Print text");
     let _ = writeln!(w, "  \\conninfo      Show connection info");
     let _ = writeln!(w, "  \\?             Show this help");
     let _ = writeln!(w, "  \\q             Quit");
@@ -215,10 +227,11 @@ fn cmd_list_tables(conn: &Arc<Connection>, w: &mut dyn Write) {
 fn cmd_describe_table(conn: &Arc<Connection>, table_name: &str, w: &mut dyn Write) {
     let safe_name = table_name.replace('\'', "''");
     let sql = format!(
-        "SELECT a.attname, t.typname, a.attnotnull, a.atthasdef, a.attnum \
+        "SELECT a.attname, t.typname, a.attnotnull, COALESCE(d.adbin, ''), a.attnum \
          FROM pg_attribute a \
          JOIN pg_class c ON a.attrelid = c.oid \
          JOIN pg_type t ON a.atttypid = t.oid \
+         LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
          WHERE c.relname = '{safe_name}' AND a.attnum > 0 AND a.attisdropped = 0 \
          ORDER BY a.attnum"
     );
@@ -239,8 +252,7 @@ fn cmd_describe_table(conn: &Arc<Connection>, table_name: &str, w: &mut dyn Writ
                 let col_type = row.get_value(1).to_string();
                 let notnull = row.get_value(2).to_string();
                 let nullable = if notnull == "1" { "NOT NULL" } else { "NULL" };
-                let hasdef = row.get_value(3).to_string();
-                let default_str = if hasdef == "1" { "YES" } else { "" };
+                let default_str = row.get_value(3).to_string();
                 table.add_row(vec![
                     Cell::new(&col_name),
                     Cell::new(&col_type),
@@ -291,11 +303,304 @@ fn cmd_conninfo(db_file: &str, w: &mut dyn Write) {
     let _ = writeln!(w, "Dialect:  PostgreSQL");
 }
 
+fn cmd_list_indexes(conn: &Arc<Connection>, w: &mut dyn Write) {
+    let sql = "SELECT c2.relname, c.relname \
+               FROM pg_index i \
+               JOIN pg_class c ON i.indexrelid = c.oid \
+               JOIN pg_class c2 ON i.indrelid = c2.oid \
+               ORDER BY 1, 2";
+    match conn.query(sql) {
+        Ok(Some(mut rows)) => {
+            let mut table = Table::new();
+            table.set_content_arrangement(ContentArrangement::Dynamic);
+            table.set_header(vec![
+                Cell::new("Table").add_attribute(Attribute::Bold),
+                Cell::new("Index").add_attribute(Attribute::Bold),
+            ]);
+            let _ = rows.run_with_row_callback(|row| {
+                let tbl = row.get_value(0).to_string();
+                let idx = row.get_value(1).to_string();
+                table.add_row(vec![Cell::new(&tbl), Cell::new(&idx)]);
+                Ok(())
+            });
+            if !table.is_empty() {
+                let _ = writeln!(w, "{table}");
+            } else {
+                let _ = writeln!(w, "No indexes found.");
+            }
+        }
+        Ok(None) => {
+            let _ = writeln!(w, "No indexes found.");
+        }
+        Err(e) => {
+            let _ = writeln!(w, "Error: {e}");
+        }
+    }
+}
+
+fn cmd_list_views(conn: &Arc<Connection>, w: &mut dyn Write) {
+    let sql = "SELECT relname FROM pg_class WHERE relkind = 'v' ORDER BY relname";
+    match conn.query(sql) {
+        Ok(Some(mut rows)) => {
+            let mut table = Table::new();
+            table.set_content_arrangement(ContentArrangement::Dynamic);
+            table.set_header(vec![Cell::new("View").add_attribute(Attribute::Bold)]);
+            let _ = rows.run_with_row_callback(|row| {
+                let name = row.get_value(0).to_string();
+                table.add_row(vec![Cell::new(&name)]);
+                Ok(())
+            });
+            if !table.is_empty() {
+                let _ = writeln!(w, "{table}");
+            } else {
+                let _ = writeln!(w, "No views found.");
+            }
+        }
+        Ok(None) => {
+            let _ = writeln!(w, "No views found.");
+        }
+        Err(e) => {
+            let _ = writeln!(w, "Error: {e}");
+        }
+    }
+}
+
+fn cmd_list_schemas(conn: &Arc<Connection>, w: &mut dyn Write) {
+    let sql = "SELECT nspname, rolname \
+               FROM pg_namespace n \
+               JOIN pg_roles r ON n.nspowner = r.oid \
+               ORDER BY nspname";
+    match conn.query(sql) {
+        Ok(Some(mut rows)) => {
+            let mut table = Table::new();
+            table.set_content_arrangement(ContentArrangement::Dynamic);
+            table.set_header(vec![
+                Cell::new("Schema").add_attribute(Attribute::Bold),
+                Cell::new("Owner").add_attribute(Attribute::Bold),
+            ]);
+            let _ = rows.run_with_row_callback(|row| {
+                let name = row.get_value(0).to_string();
+                let owner = row.get_value(1).to_string();
+                table.add_row(vec![Cell::new(&name), Cell::new(&owner)]);
+                Ok(())
+            });
+            if !table.is_empty() {
+                let _ = writeln!(w, "{table}");
+            } else {
+                let _ = writeln!(w, "No schemas found.");
+            }
+        }
+        Ok(None) => {
+            let _ = writeln!(w, "No schemas found.");
+        }
+        Err(e) => {
+            let _ = writeln!(w, "Error: {e}");
+        }
+    }
+}
+
+fn cmd_list_types(conn: &Arc<Connection>, w: &mut dyn Write) {
+    let sql = "SELECT typname, typcategory FROM pg_type WHERE typtype = 'e' ORDER BY typname";
+    match conn.query(sql) {
+        Ok(Some(mut rows)) => {
+            let mut table = Table::new();
+            table.set_content_arrangement(ContentArrangement::Dynamic);
+            table.set_header(vec![
+                Cell::new("Type").add_attribute(Attribute::Bold),
+                Cell::new("Category").add_attribute(Attribute::Bold),
+            ]);
+            let _ = rows.run_with_row_callback(|row| {
+                let name = row.get_value(0).to_string();
+                let cat = row.get_value(1).to_string();
+                table.add_row(vec![Cell::new(&name), Cell::new(&cat)]);
+                Ok(())
+            });
+            if !table.is_empty() {
+                let _ = writeln!(w, "{table}");
+            } else {
+                let _ = writeln!(w, "No types found.");
+            }
+        }
+        Ok(None) => {
+            let _ = writeln!(w, "No types found.");
+        }
+        Err(e) => {
+            let _ = writeln!(w, "Error: {e}");
+        }
+    }
+}
+
+fn cmd_list_roles(conn: &Arc<Connection>, w: &mut dyn Write) {
+    let sql = "SELECT rolname, CASE WHEN rolsuper = 1 THEN 'Superuser' ELSE '' END \
+               FROM pg_roles ORDER BY rolname";
+    match conn.query(sql) {
+        Ok(Some(mut rows)) => {
+            let mut table = Table::new();
+            table.set_content_arrangement(ContentArrangement::Dynamic);
+            table.set_header(vec![
+                Cell::new("Role").add_attribute(Attribute::Bold),
+                Cell::new("Attributes").add_attribute(Attribute::Bold),
+            ]);
+            let _ = rows.run_with_row_callback(|row| {
+                let name = row.get_value(0).to_string();
+                let attrs = row.get_value(1).to_string();
+                table.add_row(vec![Cell::new(&name), Cell::new(&attrs)]);
+                Ok(())
+            });
+            if !table.is_empty() {
+                let _ = writeln!(w, "{table}");
+            } else {
+                let _ = writeln!(w, "No roles found.");
+            }
+        }
+        Ok(None) => {
+            let _ = writeln!(w, "No roles found.");
+        }
+        Err(e) => {
+            let _ = writeln!(w, "Error: {e}");
+        }
+    }
+}
+
+fn cmd_list_functions(conn: &Arc<Connection>, w: &mut dyn Write) {
+    let sql = "SELECT p.proname, p.pronargs, COALESCE(t.typname, '') \
+               FROM pg_proc p \
+               LEFT JOIN pg_type t ON p.prorettype = t.oid \
+               ORDER BY p.proname";
+    match conn.query(sql) {
+        Ok(Some(mut rows)) => {
+            let mut table = Table::new();
+            table.set_content_arrangement(ContentArrangement::Dynamic);
+            table.set_header(vec![
+                Cell::new("Function").add_attribute(Attribute::Bold),
+                Cell::new("Args").add_attribute(Attribute::Bold),
+                Cell::new("Return Type").add_attribute(Attribute::Bold),
+            ]);
+            let _ = rows.run_with_row_callback(|row| {
+                let name = row.get_value(0).to_string();
+                let nargs = row.get_value(1).to_string();
+                let ret = row.get_value(2).to_string();
+                table.add_row(vec![Cell::new(&name), Cell::new(&nargs), Cell::new(&ret)]);
+                Ok(())
+            });
+            if !table.is_empty() {
+                let _ = writeln!(w, "{table}");
+            } else {
+                let _ = writeln!(w, "No functions found.");
+            }
+        }
+        Ok(None) => {
+            let _ = writeln!(w, "No functions found.");
+        }
+        Err(e) => {
+            let _ = writeln!(w, "Error: {e}");
+        }
+    }
+}
+
+fn cmd_describe_table_extended(conn: &Arc<Connection>, table_name: &str, w: &mut dyn Write) {
+    // First show the regular column description
+    cmd_describe_table(conn, table_name, w);
+
+    let safe_name = table_name.replace('\'', "''");
+
+    // Show indexes
+    let idx_sql = format!(
+        "SELECT c.relname \
+         FROM pg_index i \
+         JOIN pg_class c ON i.indexrelid = c.oid \
+         JOIN pg_class c2 ON i.indrelid = c2.oid \
+         WHERE c2.relname = '{safe_name}' \
+         ORDER BY c.relname"
+    );
+    if let Ok(Some(mut rows)) = conn.query(&idx_sql) {
+        let mut indexes = Vec::new();
+        let _ = rows.run_with_row_callback(|row| {
+            indexes.push(row.get_value(0).to_string());
+            Ok(())
+        });
+        if !indexes.is_empty() {
+            let _ = writeln!(w, "Indexes:");
+            for idx in &indexes {
+                let _ = writeln!(w, "  {idx}");
+            }
+        }
+    }
+
+    // Show constraints
+    let con_sql = format!(
+        "SELECT conname, contype \
+         FROM pg_constraint con \
+         JOIN pg_class c ON con.conrelid = c.oid \
+         WHERE c.relname = '{safe_name}' \
+         ORDER BY conname"
+    );
+    if let Ok(Some(mut rows)) = conn.query(&con_sql) {
+        let mut constraints = Vec::new();
+        let _ = rows.run_with_row_callback(|row| {
+            let name = row.get_value(0).to_string();
+            let ctype = row.get_value(1).to_string();
+            let kind = match ctype.as_str() {
+                "p" => "PRIMARY KEY",
+                "u" => "UNIQUE",
+                "c" => "CHECK",
+                "f" => "FOREIGN KEY",
+                _ => &ctype,
+            };
+            constraints.push(format!("{name} ({kind})"));
+            Ok(())
+        });
+        if !constraints.is_empty() {
+            let _ = writeln!(w, "Constraints:");
+            for c in &constraints {
+                let _ = writeln!(w, "  {c}");
+            }
+        }
+    }
+}
+
+fn cmd_list_tables_extended(conn: &Arc<Connection>, w: &mut dyn Write) {
+    let sql = "SELECT c.relname, c.reltuples \
+               FROM pg_class c \
+               JOIN pg_namespace n ON c.relnamespace = n.oid \
+               WHERE c.relkind = 'r' AND n.nspname = 'public' \
+               ORDER BY c.relname";
+    match conn.query(sql) {
+        Ok(Some(mut rows)) => {
+            let mut table = Table::new();
+            table.set_content_arrangement(ContentArrangement::Dynamic);
+            table.set_header(vec![
+                Cell::new("Table").add_attribute(Attribute::Bold),
+                Cell::new("Rows").add_attribute(Attribute::Bold),
+            ]);
+            let _ = rows.run_with_row_callback(|row| {
+                let name = row.get_value(0).to_string();
+                let nrows = row.get_value(1).to_string();
+                table.add_row(vec![Cell::new(&name), Cell::new(&nrows)]);
+                Ok(())
+            });
+            if !table.is_empty() {
+                let _ = writeln!(w, "{table}");
+            } else {
+                let _ = writeln!(w, "No tables found.");
+            }
+        }
+        Ok(None) => {
+            let _ = writeln!(w, "No tables found.");
+        }
+        Err(e) => {
+            let _ = writeln!(w, "Error: {e}");
+        }
+    }
+}
+
 /// Dispatch a backslash meta-command. Returns true if the REPL should quit.
 fn handle_meta_command(
     line: &str,
     conn: &Arc<Connection>,
     db_file: &str,
+    expanded_display: &mut bool,
+    timing: &mut bool,
     w: &mut dyn Write,
 ) -> bool {
     let trimmed = line.trim();
@@ -306,7 +611,21 @@ fn handle_meta_command(
     match cmd {
         "\\q" => return true,
         "\\?" => cmd_help(w),
+        "\\dt+" => cmd_list_tables_extended(conn, w),
         "\\dt" => cmd_list_tables(conn, w),
+        "\\di" => cmd_list_indexes(conn, w),
+        "\\dv" => cmd_list_views(conn, w),
+        "\\dn" => cmd_list_schemas(conn, w),
+        "\\dT" => cmd_list_types(conn, w),
+        "\\du" | "\\dg" => cmd_list_roles(conn, w),
+        "\\df" => cmd_list_functions(conn, w),
+        "\\d+" => {
+            if arg.is_empty() {
+                cmd_list_tables_extended(conn, w);
+            } else {
+                cmd_describe_table_extended(conn, arg, w);
+            }
+        }
         "\\d" => {
             if arg.is_empty() {
                 cmd_list_tables(conn, w);
@@ -315,6 +634,25 @@ fn handle_meta_command(
             }
         }
         "\\l" => cmd_list_databases(conn, w),
+        "\\x" => {
+            *expanded_display = !*expanded_display;
+            if *expanded_display {
+                let _ = writeln!(w, "Expanded display is on.");
+            } else {
+                let _ = writeln!(w, "Expanded display is off.");
+            }
+        }
+        "\\timing" => {
+            *timing = !*timing;
+            if *timing {
+                let _ = writeln!(w, "Timing is on.");
+            } else {
+                let _ = writeln!(w, "Timing is off.");
+            }
+        }
+        "\\echo" => {
+            let _ = writeln!(w, "{arg}");
+        }
         "\\conninfo" => cmd_conninfo(db_file, w),
         _ => {
             let _ = writeln!(w, "Unknown command: {cmd}. Type \\? for help.");
@@ -331,6 +669,7 @@ fn execute_sql(
     conn: &Arc<Connection>,
     sql: &str,
     table_config: &TableConfig,
+    expanded: bool,
     w: &mut dyn Write,
 ) -> bool {
     let runner = conn.query_runner(sql.as_bytes());
@@ -338,7 +677,12 @@ fn execute_sql(
     for mut output in runner {
         match output {
             Ok(Some(ref mut stmt)) => {
-                if let Err(e) = print_result_set(stmt, table_config, w) {
+                let result = if expanded {
+                    print_result_set_expanded(stmt, w)
+                } else {
+                    print_result_set(stmt, table_config, w)
+                };
+                if let Err(e) = result {
                     let _ = writeln!(w, "Error: {e}");
                     had_error = true;
                     break;
@@ -418,6 +762,39 @@ fn print_result_set(
     Ok(())
 }
 
+fn print_result_set_expanded(stmt: &mut Statement, w: &mut dyn Write) -> Result<(), LimboError> {
+    let num_columns = stmt.num_columns();
+    if num_columns == 0 {
+        stmt.run_with_row_callback(|_| Ok(()))?;
+        return Ok(());
+    }
+
+    let column_names: Vec<String> = (0..num_columns)
+        .map(|i| stmt.get_column_name(i).to_string())
+        .collect();
+
+    let max_col_width = column_names.iter().map(|n| n.len()).max().unwrap_or(0);
+    let mut record_num = 0u64;
+
+    stmt.run_with_row_callback(|row| {
+        record_num += 1;
+        let separator = "-".repeat(max_col_width + 3);
+        writeln!(w, "-[ RECORD {record_num} ]{separator}")
+            .map_err(|e| turso_core::io_error(e, "write"))?;
+        for (idx, value) in row.get_values().enumerate() {
+            let col = &column_names[idx];
+            let val_str = match value {
+                Value::Null => "NULL".to_string(),
+                _ => format!("{value}"),
+            };
+            writeln!(w, "{col:<max_col_width$} | {val_str}")
+                .map_err(|e| turso_core::io_error(e, "write"))?;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // REPL
 // ---------------------------------------------------------------------------
@@ -439,6 +816,8 @@ struct Repl {
     read_state: ReadState,
     interrupt_count: Arc<AtomicUsize>,
     had_error: bool,
+    expanded_display: bool,
+    timing: bool,
 }
 
 impl Repl {
@@ -458,6 +837,8 @@ impl Repl {
             read_state: ReadState::default(),
             interrupt_count,
             had_error: false,
+            expanded_display: false,
+            timing: false,
         }
     }
 
@@ -488,6 +869,8 @@ impl Repl {
                 input.trim(),
                 &self.conn,
                 &self.db_file,
+                &mut self.expanded_display,
+                &mut self.timing,
                 &mut std::io::stdout(),
             );
             self.reset_input();
@@ -500,12 +883,26 @@ impl Repl {
         let is_complete = self.read_state.is_complete();
         if is_complete || flush {
             let sql = self.input_buf.clone();
+            let start = if self.timing {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let had_err = execute_sql(
                 &self.conn,
                 sql.trim(),
                 &self.table_config,
+                self.expanded_display,
                 &mut std::io::stdout(),
             );
+            if let Some(start) = start {
+                let elapsed = start.elapsed();
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "Time: {:.3}ms",
+                    elapsed.as_secs_f64() * 1000.0
+                );
+            }
             if had_err {
                 self.had_error = true;
             }
@@ -621,7 +1018,7 @@ fn main() -> anyhow::Result<()> {
 
     // Execute a single SQL command and exit
     if let Some(ref sql) = opts.sql {
-        let had_error = execute_sql(&conn, sql, &table_config, &mut std::io::stdout());
+        let had_error = execute_sql(&conn, sql, &table_config, false, &mut std::io::stdout());
         conn.close()?;
         if had_error {
             std::process::exit(1);

@@ -1,5 +1,34 @@
+use crate::ext::register_scalar_function;
 use crate::types::Value;
 use crate::Connection;
+use turso_ext::{scalar, ExtensionApi, Value as ExtValue};
+
+/// Register PostgreSQL-compatible scalar functions.
+///
+/// These are thin wrappers that map common PG function names to their Turso
+/// equivalents, so that `DEFAULT now()`, `SELECT clock_timestamp()`, etc. work
+/// without relying solely on translator-level rewriting.
+pub fn register_pg_functions(ext_api: &mut ExtensionApi) {
+    unsafe {
+        register_scalar_function(ext_api.ctx, c"now".as_ptr(), pg_now);
+        register_scalar_function(ext_api.ctx, c"clock_timestamp".as_ptr(), pg_now);
+        register_scalar_function(ext_api.ctx, c"transaction_timestamp".as_ptr(), pg_now);
+        register_scalar_function(ext_api.ctx, c"statement_timestamp".as_ptr(), pg_now);
+    }
+}
+
+/// Returns the current timestamp as `YYYY-MM-DD HH:MM:SS.mmm`.
+///
+/// This is the Turso equivalent of PostgreSQL's `now()`, `clock_timestamp()`,
+/// `transaction_timestamp()`, and `statement_timestamp()`. All four are mapped
+/// to the same implementation since Turso does not distinguish between
+/// transaction-time and wall-clock time.
+#[scalar(name = "now")]
+fn pg_now(_args: &[ExtValue]) -> ExtValue {
+    let now = chrono::Utc::now();
+    let formatted = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    ExtValue::from_text(formatted)
+}
 
 pub fn exec_pg_get_user_by_id(_oid: i64) -> Value {
     Value::build_text("turso")
