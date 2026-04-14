@@ -394,13 +394,15 @@ impl InternalVirtualTable for PgNamespaceTable {
 }
 
 struct PgNamespaceCursor {
+    conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
 
 impl PgNamespaceCursor {
-    fn new(_conn: Arc<Connection>) -> Self {
+    fn new(conn: Arc<Connection>) -> Self {
         Self {
+            conn,
             rows: Vec::new(),
             current_row: 0,
         }
@@ -428,6 +430,26 @@ impl PgNamespaceCursor {
                 Value::Null,                              // nspacl
             ],
         ];
+
+        // Add attached schemas (CREATE SCHEMA creates attached databases)
+        let schema_names: Vec<String> = self
+            .conn
+            .attached_databases
+            .read()
+            .name_to_index
+            .keys()
+            .cloned()
+            .collect();
+        let mut oid = 16384i64;
+        for name in schema_names {
+            self.rows.push(vec![
+                Value::from_i64(oid),
+                Value::build_text(name),
+                Value::from_i64(10), // nspowner (bootstrap superuser)
+                Value::Null,         // nspacl
+            ]);
+            oid += 1;
+        }
         Ok(())
     }
 }
@@ -2828,14 +2850,12 @@ impl PgGetTableDefCursor {
     /// Read all table SQL strings from sqlite_master into a map.
     fn load_sqlite_master_sql(&self) -> Result<HashMap<String, String>, LimboError> {
         let mut map = HashMap::default();
-        let mut stmt = self.conn.prepare_internal(
-            "SELECT name, sql FROM sqlite_schema WHERE type = 'table'",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")?;
         let rows = stmt.run_collect_rows()?;
         for row in rows {
-            if let (Some(Value::Text(name)), Some(Value::Text(sql))) =
-                (row.first(), row.get(1))
-            {
+            if let (Some(Value::Text(name)), Some(Value::Text(sql))) = (row.first(), row.get(1)) {
                 map.insert(name.as_str().to_string(), sql.as_str().to_string());
             }
         }

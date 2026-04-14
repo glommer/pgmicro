@@ -76,8 +76,8 @@ impl Connection {
     }
 
     /// Handle CREATE SCHEMA in PostgreSQL mode.
-    /// Maps to ATTACH with an in-memory database.
-    /// File-backed persistence (turso-postgres-schema-<name>.db) is handled by the CLI layer.
+    /// Maps to ATTACH 'turso-postgres-schema-<name>.db' AS "<name>".
+    /// The schema database file is created in the same directory as the main database.
     fn handle_pg_create_schema(self: &Arc<Self>, stmt: &PgCreateSchemaStmt) -> Result<()> {
         let name = stmt.name.to_lowercase();
         if name == "public" {
@@ -97,7 +97,24 @@ impl Connection {
                 "schema \"{name}\" already exists"
             )));
         }
-        self.attach_database(":memory:", &name)
+        let path = self.schema_file_path(&name);
+        self.attach_database(&path, &name)
+    }
+
+    /// Compute the file path for a schema database.
+    /// For file-backed main databases, creates it in the same directory.
+    /// For in-memory main databases, creates a file in the current directory.
+    fn schema_file_path(&self, schema_name: &str) -> String {
+        let main_path = &self.db.path;
+        let filename = format!("turso-postgres-schema-{schema_name}.db");
+        if main_path == ":memory:" {
+            filename
+        } else {
+            let parent = std::path::Path::new(main_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            parent.join(&filename).to_string_lossy().to_string()
+        }
     }
 
     /// Handle DROP SCHEMA in PostgreSQL mode.
