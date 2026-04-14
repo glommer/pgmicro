@@ -556,3 +556,59 @@ fn array_in_where_clause() {
         "should only return id=2"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dollar-quoted and escape strings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dollar_quoted_string() {
+    let output = run_pgmicro(b"SELECT $$hello world$$;\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("hello world"),
+        "expected 'hello world', got: {out}"
+    );
+}
+
+#[test]
+fn dollar_quoted_with_embedded_quote() {
+    let output = run_pgmicro(b"SELECT $$it's fine$$;\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("it's fine"),
+        "expected embedded quote, got: {out}"
+    );
+}
+
+#[test]
+fn tagged_dollar_quoted_string() {
+    let output = run_pgmicro(b"SELECT $tag$content$tag$;\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("content"), "expected 'content', got: {out}");
+}
+
+#[test]
+fn escape_string_backslash_n() {
+    let output = run_pgmicro(b"SELECT E'line1\\nline2';\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("line1") && out.contains("line2"),
+        "expected two lines, got: {out}"
+    );
+}
+
+#[test]
+fn escape_string_backslash_t() {
+    let output = run_pgmicro(b"SELECT E'col1\\tcol2';\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("col1") && out.contains("col2"),
+        "expected tab-separated, got: {out}"
+    );
+}
