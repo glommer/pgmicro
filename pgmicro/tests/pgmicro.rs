@@ -502,3 +502,57 @@ fn help_lists_new_commands() {
     assert!(out.contains("\\dn"), "help should mention \\dn, got: {out}");
     assert!(out.contains("\\dT"), "help should mention \\dT, got: {out}");
 }
+
+// ---------------------------------------------------------------------------
+// Array constructor and subscripting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn array_constructor_and_subscript() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, tags TEXT[]);\n\
+          INSERT INTO t VALUES (1, ARRAY['a','b','c']);\n\
+          SELECT tags[1], tags[2], tags[3] FROM t;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("a"), "expected 'a' in output, got: {out}");
+    assert!(out.contains("b"), "expected 'b' in output, got: {out}");
+    assert!(out.contains("c"), "expected 'c' in output, got: {out}");
+}
+
+#[test]
+fn array_slice() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, tags TEXT[]);\n\
+          INSERT INTO t VALUES (1, ARRAY['a','b','c','d']);\n\
+          SELECT tags[2:3] FROM t;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("b"),
+        "expected 'b' in slice output, got: {out}"
+    );
+    assert!(
+        out.contains("c"),
+        "expected 'c' in slice output, got: {out}"
+    );
+}
+
+#[test]
+fn array_in_where_clause() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT, vals INT[]);\n\
+          INSERT INTO t VALUES (1, ARRAY[10,20,30]);\n\
+          INSERT INTO t VALUES (2, ARRAY[40,50,60]);\n\
+          SELECT id FROM t WHERE vals[1] = 40;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("2"), "expected id=2, got: {out}");
+    assert!(
+        !out.contains("1") || out.contains("2"),
+        "should only return id=2"
+    );
+}

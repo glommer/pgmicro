@@ -1921,6 +1921,99 @@ impl PostgreSQLTranslator {
                 // replaces Expr::Default with the column's schema default.
                 Ok(ast::Expr::Default)
             }
+            Some(pg_query::protobuf::node::Node::AArrayExpr(array_expr)) => {
+                // Desugar ARRAY[...] into array(...) function call
+                let args = array_expr
+                    .elements
+                    .iter()
+                    .map(|e| Ok(Box::new(self.translate_expr(e)?)))
+                    .collect::<Result<Vec<_>, ParseError>>()?;
+                Ok(ast::Expr::FunctionCall {
+                    name: ast::Name::from_string("array"),
+                    distinctness: None,
+                    args,
+                    order_by: vec![],
+                    filter_over: ast::FunctionTail {
+                        filter_clause: None,
+                        over_clause: None,
+                    },
+                })
+            }
+            Some(pg_query::protobuf::node::Node::AIndirection(indirection)) => {
+                let arg = indirection
+                    .arg
+                    .as_ref()
+                    .ok_or_else(|| ParseError::ParseError("AIndirection missing arg".into()))?;
+                let mut expr = self.translate_expr(arg)?;
+                // Each indirection step is either an index (AIndices) or a field name (String)
+                for step in &indirection.indirection {
+                    match &step.node {
+                        Some(pg_query::protobuf::node::Node::AIndices(indices)) => {
+                            if indices.is_slice {
+                                // Slice: expr[start:end] → array_slice(expr, start, end)
+                                let start = indices.lidx.as_ref().ok_or_else(|| {
+                                    ParseError::ParseError("Array slice missing lower index".into())
+                                })?;
+                                let end = indices.uidx.as_ref().ok_or_else(|| {
+                                    ParseError::ParseError("Array slice missing upper index".into())
+                                })?;
+                                let start_expr = self.translate_expr(start)?;
+                                let end_expr = self.translate_expr(end)?;
+                                expr = ast::Expr::FunctionCall {
+                                    name: ast::Name::from_string("array_slice"),
+                                    distinctness: None,
+                                    args: vec![
+                                        Box::new(expr),
+                                        Box::new(start_expr),
+                                        Box::new(end_expr),
+                                    ],
+                                    order_by: vec![],
+                                    filter_over: ast::FunctionTail {
+                                        filter_clause: None,
+                                        over_clause: None,
+                                    },
+                                };
+                            } else {
+                                // Subscript: expr[index] → array_element(expr, index)
+                                let index_node = indices.uidx.as_ref().ok_or_else(|| {
+                                    ParseError::ParseError("Array subscript missing index".into())
+                                })?;
+                                let index_expr = self.translate_expr(index_node)?;
+                                expr = ast::Expr::FunctionCall {
+                                    name: ast::Name::from_string("array_element"),
+                                    distinctness: None,
+                                    args: vec![Box::new(expr), Box::new(index_expr)],
+                                    order_by: vec![],
+                                    filter_over: ast::FunctionTail {
+                                        filter_clause: None,
+                                        over_clause: None,
+                                    },
+                                };
+                            }
+                        }
+                        Some(pg_query::protobuf::node::Node::String(s)) => {
+                            // Field access: expr.field — treat as qualified name
+                            expr = ast::Expr::Qualified(
+                                match expr {
+                                    ast::Expr::Id(name) => name,
+                                    _ => {
+                                        return Err(ParseError::ParseError(
+                                            "Field access on non-identifier expression".into(),
+                                        ))
+                                    }
+                                },
+                                ast::Name::from_string(s.sval.clone()),
+                            );
+                        }
+                        other => {
+                            return Err(ParseError::ParseError(format!(
+                                "Unsupported indirection step: {other:?}"
+                            )));
+                        }
+                    }
+                }
+                Ok(expr)
+            }
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list
                 Err(ParseError::ParseError(
@@ -5524,6 +5617,87 @@ mod tests {
                     assert_eq!(name.as_str(), "array_overlap");
                 } else {
                     panic!("Expected FunctionCall for &&, got: {wc:?}");
+                }
+            } else {
+                panic!("Expected Select variant");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn test_array_constructor() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT ARRAY['a', 'b', 'c']";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { columns, .. } = &select.body.select {
+                let col = &columns[0];
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    if let ast::Expr::FunctionCall { name, args, .. } = &**expr {
+                        assert_eq!(name.as_str(), "array");
+                        assert_eq!(args.len(), 3);
+                    } else {
+                        panic!("Expected FunctionCall for ARRAY[...], got: {expr:?}");
+                    }
+                } else {
+                    panic!("Expected Expr column");
+                }
+            } else {
+                panic!("Expected Select variant");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn test_array_subscript() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT tags[1] FROM t";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { columns, .. } = &select.body.select {
+                let col = &columns[0];
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    if let ast::Expr::FunctionCall { name, args, .. } = &**expr {
+                        assert_eq!(name.as_str(), "array_element");
+                        assert_eq!(args.len(), 2);
+                    } else {
+                        panic!("Expected FunctionCall for tags[1], got: {expr:?}");
+                    }
+                } else {
+                    panic!("Expected Expr column");
+                }
+            } else {
+                panic!("Expected Select variant");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn test_array_slice() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT tags[1:3] FROM t";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { columns, .. } = &select.body.select {
+                let col = &columns[0];
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    if let ast::Expr::FunctionCall { name, args, .. } = &**expr {
+                        assert_eq!(name.as_str(), "array_slice");
+                        assert_eq!(args.len(), 3);
+                    } else {
+                        panic!("Expected FunctionCall for tags[1:3], got: {expr:?}");
+                    }
+                } else {
+                    panic!("Expected Expr column");
                 }
             } else {
                 panic!("Expected Select variant");
