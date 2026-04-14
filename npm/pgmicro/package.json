@@ -1,6 +1,6 @@
 {
   "name": "pg-micro",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "pgmicro — a PostgreSQL-compatible embeddable database",
   "repository": {
     "type": "git",
@@ -37,9 +37,9 @@
     "@tursodatabase/database-common": "^0.6.0-pre.7"
   },
   "optionalDependencies": {
-    "pg-micro-darwin-arm64": "0.0.3",
-    "pg-micro-linux-x64-gnu": "0.0.3",
-    "pg-micro-linux-arm64-gnu": "0.0.3"
+    "pg-micro-darwin-arm64": "0.0.4",
+    "pg-micro-linux-x64-gnu": "0.0.4",
+    "pg-micro-linux-arm64-gnu": "0.0.4"
   },
   "napi": {
     "binaryName": "pgmicro",
