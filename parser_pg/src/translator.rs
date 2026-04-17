@@ -2315,14 +2315,34 @@ impl PostgreSQLTranslator {
             })
             .ok_or_else(|| ParseError::ParseError("Missing operator name".to_string()))?;
 
+        // Handle unary operators (no left expression)
+        if a_expr.lexpr.is_none() {
+            let rhs = a_expr
+                .rexpr
+                .as_ref()
+                .ok_or_else(|| ParseError::ParseError("Missing right expression".into()))?;
+            let operand = self.translate_expr(rhs)?;
+            return match op_name {
+                "+" => Ok(ast::Expr::Unary(
+                    ast::UnaryOperator::Positive,
+                    Box::new(operand),
+                )),
+                "-" => Ok(ast::Expr::Unary(
+                    ast::UnaryOperator::Negative,
+                    Box::new(operand),
+                )),
+                "~" => Ok(ast::Expr::Unary(
+                    ast::UnaryOperator::BitwiseNot,
+                    Box::new(operand),
+                )),
+                _ => Err(ParseError::ParseError(format!(
+                    "Unsupported unary operator: {op_name}"
+                ))),
+            };
+        }
+
         // Translate left and right expressions
-        let left = if let Some(lexpr) = &a_expr.lexpr {
-            Box::new(self.translate_expr(lexpr)?)
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing left expression".to_string(),
-            ));
-        };
+        let left = Box::new(self.translate_expr(a_expr.lexpr.as_ref().unwrap())?);
 
         let right = if let Some(rexpr) = &a_expr.rexpr {
             Box::new(self.translate_expr(rexpr)?)
@@ -4347,6 +4367,24 @@ mod tests {
         } else {
             panic!("expected CreateTable, got {stmt:?}");
         }
+    }
+
+    #[test]
+    fn test_unary_plus() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT +42";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        assert!(matches!(stmt, ast::Stmt::Select(_)));
+    }
+
+    #[test]
+    fn test_unary_minus() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT -42";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        assert!(matches!(stmt, ast::Stmt::Select(_)));
     }
 
     #[test]
