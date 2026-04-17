@@ -60,8 +60,9 @@ use crate::{
             exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
         postgres::{
-            exec_lpad, exec_pg_encoding_to_char, exec_pg_format_type, exec_pg_get_constraintdef,
-            exec_pg_get_indexdef, exec_pg_get_user_by_id, exec_pg_is_visible, exec_rpad,
+            exec_gcd, exec_lcm, exec_lpad, exec_pg_encoding_to_char, exec_pg_format_type,
+            exec_pg_get_constraintdef, exec_pg_get_indexdef, exec_pg_get_user_by_id,
+            exec_pg_input_is_valid, exec_pg_is_visible, exec_repeat, exec_rpad, exec_to_char,
         },
         printf::exec_printf,
     },
@@ -6573,6 +6574,52 @@ pub fn op_function(
                     " ".to_string()
                 };
                 state.registers[*dest].set_value(exec_rpad(input, length, &fill));
+            }
+            ScalarFunc::Gcd => {
+                let a = state.registers[*start_reg]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                let b = state.registers[*start_reg + 1]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                state.registers[*dest].set_value(exec_gcd(a, b));
+            }
+            ScalarFunc::Lcm => {
+                let a = state.registers[*start_reg]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                let b = state.registers[*start_reg + 1]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                state.registers[*dest].set_value(exec_lcm(a, b));
+            }
+            ScalarFunc::Repeat => {
+                let input = state.registers[*start_reg].get_value();
+                let count = state.registers[*start_reg + 1]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                state.registers[*dest].set_value(exec_repeat(input, count));
+            }
+            ScalarFunc::ToChar => {
+                let value = state.registers[*start_reg].get_value();
+                let format = match &state.registers[*start_reg + 1] {
+                    Register::Value(Value::Text(s)) => s.as_str().to_string(),
+                    _ => String::new(),
+                };
+                state.registers[*dest].set_value(exec_to_char(value, &format));
+            }
+            ScalarFunc::PgInputIsValid => {
+                let input = state.registers[*start_reg].get_value();
+                let type_name = match &state.registers[*start_reg + 1] {
+                    Register::Value(Value::Text(s)) => s.as_str().to_string(),
+                    _ => String::new(),
+                };
+                state.registers[*dest].set_value(exec_pg_input_is_valid(input, &type_name));
             }
             ScalarFunc::Abs
             | ScalarFunc::Lower
