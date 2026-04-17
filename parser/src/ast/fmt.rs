@@ -772,6 +772,10 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some(type_name))?;
                 Ok(())
             }
+            Self::Copy { .. } => {
+                // COPY is handled at the connection layer, not serialized back to SQL
+                Ok(())
+            }
         }
     }
 }

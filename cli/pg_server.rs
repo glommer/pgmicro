@@ -194,7 +194,7 @@ impl SimpleQueryHandler for TursoPgHandler {
 
             self.cleanup_dropped_schema_file(sql);
 
-            if stmt.num_columns() == 0 {
+            if stmt.num_columns() == 0 || is_pg_non_query(sql) {
                 responses.push(execute_non_query(&mut stmt, sql)?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
@@ -237,7 +237,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
-        if stmt.num_columns() == 0 {
+        if stmt.num_columns() == 0 || is_pg_non_query(query) {
             return execute_non_query(&mut stmt, query);
         }
 
@@ -614,6 +614,16 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     }
 }
 
+/// PG statements handled by `try_prepare_pg()` that return a dummy SELECT
+/// but should produce a command-tag response, not a result set.
+fn is_pg_non_query(sql: &str) -> bool {
+    let upper = sql.trim().to_uppercase();
+    upper.starts_with("COPY")
+        || upper.starts_with("CREATE SCHEMA")
+        || upper.starts_with("DROP SCHEMA")
+        || upper.starts_with("REFRESH MATERIALIZED VIEW")
+}
+
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
     let upper = query.trim().to_uppercase();
     if upper.starts_with("INSERT") {
@@ -652,6 +662,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("RELEASE")
     } else if upper.starts_with("SET") {
         Tag::new("SET")
+    } else if upper.starts_with("COPY") {
+        Tag::new("COPY").with_rows(affected_rows)
     } else {
         Tag::new("OK")
     }

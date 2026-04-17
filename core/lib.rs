@@ -25,6 +25,7 @@ pub(crate) mod thread;
 
 mod assert;
 mod connection;
+mod copy;
 mod error;
 mod ext;
 mod fast_lock;

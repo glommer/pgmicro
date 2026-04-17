@@ -105,6 +105,7 @@ impl PostgreSQLTranslator {
             NodeRef::ViewStmt(view) => self.translate_create_view(view),
             NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas),
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt),
+            NodeRef::CopyStmt(copy) => self.translate_copy(copy),
             _ => Err(ParseError::ParseError(format!(
                 "{} is not supported",
                 node_ref_name(&node.0)
@@ -3319,6 +3320,115 @@ impl PostgreSQLTranslator {
             ))),
         }
     }
+
+    fn translate_copy(&self, copy: &pg_query::protobuf::CopyStmt) -> Result<ast::Stmt, ParseError> {
+        let relation = copy
+            .relation
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("COPY: missing table name".into()))?;
+        let table_name = self.qualified_name_from_range_var(relation);
+
+        let columns = if copy.attlist.is_empty() {
+            None
+        } else {
+            let cols: Vec<ast::Name> = copy
+                .attlist
+                .iter()
+                .map(|n| {
+                    let name = match &n.node {
+                        Some(pg_query::protobuf::node::Node::String(s)) => s.sval.clone(),
+                        _ => String::new(),
+                    };
+                    ast::Name::from_string(name)
+                })
+                .collect();
+            Some(cols)
+        };
+
+        let direction = if copy.is_from {
+            ast::CopyDirection::From
+        } else {
+            ast::CopyDirection::To
+        };
+
+        let target = if copy.filename.is_empty() {
+            if copy.is_from {
+                ast::CopyTarget::Stdin
+            } else {
+                ast::CopyTarget::Stdout
+            }
+        } else if copy.is_program {
+            ast::CopyTarget::Program(copy.filename.clone())
+        } else {
+            ast::CopyTarget::File(copy.filename.clone())
+        };
+
+        let mut format = ast::CopyFormat::Text;
+        let mut delimiter = None;
+        let mut header = false;
+        let mut null_string = None;
+        let mut quote = None;
+        let mut escape = None;
+
+        for opt in &copy.options {
+            let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
+                continue;
+            };
+            match def.defname.as_str() {
+                "format" => {
+                    if let Some(val) = def_elem_string_val(def) {
+                        match val.to_lowercase().as_str() {
+                            "csv" => format = ast::CopyFormat::Csv,
+                            "binary" => format = ast::CopyFormat::Binary,
+                            _ => format = ast::CopyFormat::Text,
+                        }
+                    }
+                }
+                "delimiter" => delimiter = def_elem_string_val(def),
+                "header" => header = def_elem_bool_val(def).unwrap_or(true),
+                "null" => null_string = def_elem_string_val(def),
+                "quote" => quote = def_elem_string_val(def),
+                "escape" => escape = def_elem_string_val(def),
+                _ => {}
+            }
+        }
+
+        Ok(ast::Stmt::Copy {
+            table_name,
+            columns,
+            direction,
+            target,
+            format,
+            delimiter,
+            header,
+            null_string,
+            quote,
+            escape,
+        })
+    }
+}
+
+/// Extract a string value from a DefElem's arg.
+fn def_elem_string_val(def: &pg_query::protobuf::DefElem) -> Option<String> {
+    let arg = def.arg.as_deref()?;
+    match &arg.node {
+        Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+        _ => None,
+    }
+}
+
+/// Extract a boolean value from a DefElem's arg.
+/// If arg is None (bare keyword like HEADER), returns None (caller defaults to true).
+fn def_elem_bool_val(def: &pg_query::protobuf::DefElem) -> Option<bool> {
+    let arg = def.arg.as_deref()?;
+    match &arg.node {
+        Some(pg_query::protobuf::node::Node::Integer(i)) => Some(i.ival != 0),
+        Some(pg_query::protobuf::node::Node::String(s)) => Some(matches!(
+            s.sval.to_lowercase().as_str(),
+            "true" | "on" | "1"
+        )),
+        _ => None,
+    }
 }
 
 /// Result of mapping a PostgreSQL type: the Turso type name and array dimensions.
@@ -3805,6 +3915,97 @@ pub fn is_refresh_matview(parse_result: &ParseResult) -> bool {
         return false;
     }
     matches!(&nodes[0].0, NodeRef::RefreshMatViewStmt(_))
+}
+
+/// Extracted COPY FROM statement info for use by the connection layer.
+#[derive(Debug, Clone)]
+pub struct PgCopyFromStmt {
+    pub table_name: String,
+    pub schema_name: Option<String>,
+    pub columns: Option<Vec<String>>,
+    pub filename: String,
+    pub delimiter: Option<String>,
+    pub header: bool,
+    pub null_string: Option<String>,
+}
+
+/// Try to extract a COPY FROM file statement from pg_query parse output.
+/// Returns None if the statement is not a COPY FROM with a filename.
+pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::CopyStmt(copy) = &nodes[0].0 else {
+        return None;
+    };
+
+    // Only handle COPY FROM with a file path (not STDIN, not COPY TO)
+    if !copy.is_from || copy.filename.is_empty() || copy.is_program {
+        return None;
+    }
+
+    let relation = copy.relation.as_ref()?;
+    let table_name = relation.relname.clone();
+    let schema_name = if relation.schemaname.is_empty()
+        || matches!(
+            relation.schemaname.to_lowercase().as_str(),
+            "public" | "pg_catalog"
+        ) {
+        None
+    } else {
+        Some(relation.schemaname.clone())
+    };
+
+    let columns = if copy.attlist.is_empty() {
+        None
+    } else {
+        let cols: Vec<String> = copy
+            .attlist
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect();
+        Some(cols)
+    };
+
+    let mut delimiter = None;
+    let mut header = false;
+    let mut null_string = None;
+
+    for opt in &copy.options {
+        let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
+            continue;
+        };
+        match def.defname.as_str() {
+            "format" => {
+                // Only support text format for now
+                if let Some(val) = def_elem_string_val(def) {
+                    if val.to_lowercase() != "text" {
+                        return None; // unsupported format
+                    }
+                }
+            }
+            "delimiter" => delimiter = def_elem_string_val(def),
+            "header" => header = def_elem_bool_val(def).unwrap_or(true),
+            "null" => null_string = def_elem_string_val(def),
+            _ => {}
+        }
+    }
+
+    Some(PgCopyFromStmt {
+        table_name,
+        schema_name,
+        columns,
+        filename: copy.filename.clone(),
+        delimiter,
+        header,
+        null_string,
+    })
 }
 
 /// Parse a SQL referential action string to an AST RefAct.
@@ -5997,5 +6198,154 @@ mod tests {
                 assert!(window_clause[0].window.frame_clause.is_none());
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // COPY statement translation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_copy_from_file() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "COPY users FROM '/path/to/file.tsv'";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::Copy {
+                table_name,
+                columns,
+                direction,
+                target,
+                format,
+                delimiter,
+                header,
+                ..
+            } => {
+                assert_eq!(table_name.name.as_str(), "users");
+                assert!(columns.is_none());
+                assert_eq!(direction, ast::CopyDirection::From);
+                assert_eq!(target, ast::CopyTarget::File("/path/to/file.tsv".into()));
+                assert_eq!(format, ast::CopyFormat::Text);
+                assert!(delimiter.is_none());
+                assert!(!header);
+            }
+            other => panic!("Expected Copy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_copy_from_with_columns() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "COPY users (id, name) FROM '/path/to/file.tsv'";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::Copy {
+                columns, direction, ..
+            } => {
+                assert_eq!(direction, ast::CopyDirection::From);
+                let cols = columns.unwrap();
+                assert_eq!(cols.len(), 2);
+                assert_eq!(cols[0].as_str(), "id");
+                assert_eq!(cols[1].as_str(), "name");
+            }
+            other => panic!("Expected Copy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_copy_from_csv_options() {
+        let translator = PostgreSQLTranslator::new();
+        let sql =
+            "COPY users FROM '/path' WITH (FORMAT csv, DELIMITER ',', HEADER true, NULL 'NA')";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::Copy {
+                format,
+                delimiter,
+                header,
+                null_string,
+                ..
+            } => {
+                assert_eq!(format, ast::CopyFormat::Csv);
+                assert_eq!(delimiter, Some(",".into()));
+                assert!(header);
+                assert_eq!(null_string, Some("NA".into()));
+            }
+            other => panic!("Expected Copy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_copy_from_stdin() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "COPY users FROM STDIN";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::Copy {
+                direction, target, ..
+            } => {
+                assert_eq!(direction, ast::CopyDirection::From);
+                assert_eq!(target, ast::CopyTarget::Stdin);
+            }
+            other => panic!("Expected Copy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_copy_to_file() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "COPY users TO '/path/to/output.csv'";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::Copy {
+                direction, target, ..
+            } => {
+                assert_eq!(direction, ast::CopyDirection::To);
+                assert_eq!(target, ast::CopyTarget::File("/path/to/output.csv".into()));
+            }
+            other => panic!("Expected Copy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_extract_copy_from() {
+        let parsed = crate::parse("COPY users FROM '/tmp/data.tsv'").unwrap();
+        let copy = try_extract_copy_from(&parsed).unwrap();
+        assert_eq!(copy.table_name, "users");
+        assert!(copy.schema_name.is_none());
+        assert!(copy.columns.is_none());
+        assert_eq!(copy.filename, "/tmp/data.tsv");
+        assert!(!copy.header);
+        assert!(copy.delimiter.is_none());
+        assert!(copy.null_string.is_none());
+    }
+
+    #[test]
+    fn test_try_extract_copy_from_not_to() {
+        let parsed = crate::parse("COPY users TO '/tmp/out.tsv'").unwrap();
+        assert!(try_extract_copy_from(&parsed).is_none());
+    }
+
+    #[test]
+    fn test_try_extract_copy_from_not_stdin() {
+        let parsed = crate::parse("COPY users FROM STDIN").unwrap();
+        assert!(try_extract_copy_from(&parsed).is_none());
+    }
+
+    #[test]
+    fn test_try_extract_copy_from_with_columns() {
+        let parsed = crate::parse("COPY users (id, name) FROM '/tmp/data.tsv'").unwrap();
+        let copy = try_extract_copy_from(&parsed).unwrap();
+        let cols = copy.columns.unwrap();
+        assert_eq!(cols, vec!["id", "name"]);
     }
 }

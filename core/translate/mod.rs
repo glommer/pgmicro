@@ -374,6 +374,9 @@ pub fn translate_inner(
             program,
             connection,
         )?,
+        ast::Stmt::Copy { .. } => {
+            bail_parse_error!("COPY is handled at the connection layer")
+        }
     };
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction

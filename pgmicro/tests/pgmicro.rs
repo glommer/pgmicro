@@ -1,5 +1,6 @@
-use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, Command, Output, Stdio};
 
 fn run_pgmicro(input: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pgmicro"))
@@ -801,4 +802,235 @@ fn named_window_running_total() {
     assert!(out.contains("10"), "expected running total 10, got: {out}");
     assert!(out.contains("30"), "expected running total 30, got: {out}");
     assert!(out.contains("60"), "expected running total 60, got: {out}");
+}
+
+// ---------------------------------------------------------------------------
+// COPY FROM via REPL
+// ---------------------------------------------------------------------------
+
+/// Write content to a temp file and return its path (file is kept alive via the path).
+fn write_temp_copy_file(name: &str, content: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("pgmicro_test_{name}_{}.tsv", std::process::id()));
+    std::fs::write(&path, content).expect("failed to write temp file");
+    path
+}
+
+#[test]
+fn copy_from_basic_repl() {
+    let path = write_temp_copy_file("basic", "1\tAlice\n2\tBob\n");
+    let input = format!(
+        "CREATE TABLE users(id INT, name TEXT);\nCOPY users FROM '{}';\nSELECT id, name FROM users ORDER BY id;\n",
+        path.display()
+    );
+    let output = run_pgmicro(input.as_bytes());
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("Alice"), "expected Alice, got: {out}");
+    assert!(out.contains("Bob"), "expected Bob, got: {out}");
+}
+
+#[test]
+fn copy_from_with_options_repl() {
+    let path = write_temp_copy_file("opts", "id|name\n1|Alice\n2|<nil>\n");
+    let input = format!(
+        "CREATE TABLE t(id INT, name TEXT);\nCOPY t FROM '{}' WITH (DELIMITER '|', NULL '<nil>', HEADER true);\nSELECT id, name FROM t ORDER BY id;\n",
+        path.display()
+    );
+    let output = run_pgmicro(input.as_bytes());
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("Alice"), "expected Alice, got: {out}");
+    // Row 2 has NULL name — should not show <nil> as text
+    assert!(
+        !out.contains("<nil>"),
+        "NULL should not appear as <nil>: {out}"
+    );
+}
+
+#[test]
+fn copy_from_file_not_found_repl() {
+    let output =
+        run_pgmicro(b"CREATE TABLE t(id INT);\nCOPY t FROM '/nonexistent/path/data.tsv';\n");
+    // Should fail with nonzero exit
+    assert_ne!(output.status.code(), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// Wire protocol: COPY FROM returns "COPY N"
+// ---------------------------------------------------------------------------
+
+/// Start pgmicro with --server and wait for it to be ready.
+fn start_pgmicro_server(port: u16) -> Child {
+    let addr = format!("127.0.0.1:{port}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pgmicro"))
+        .arg(":memory:")
+        .arg("--server")
+        .arg(&addr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start pgmicro server");
+
+    // Wait for the server to be ready by polling TCP connect
+    for _ in 0..50 {
+        if TcpStream::connect(&addr).is_ok() {
+            return child;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    child.kill().ok();
+    child.wait().ok();
+    panic!("pgmicro server did not start on {addr}");
+}
+
+/// Minimal PG wire protocol client for testing.
+/// Sends startup + simple query and reads responses.
+struct PgTestClient {
+    stream: TcpStream,
+}
+
+impl PgTestClient {
+    fn connect(port: u16) -> Self {
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut client = Self { stream };
+        client.send_startup();
+        client.read_until_ready();
+        client
+    }
+
+    /// Send StartupMessage (protocol v3.0)
+    fn send_startup(&mut self) {
+        let mut buf = Vec::new();
+        // protocol version 3.0
+        buf.extend_from_slice(&196608i32.to_be_bytes());
+        // user=turso
+        buf.extend_from_slice(b"user\0turso\0");
+        // database=main
+        buf.extend_from_slice(b"database\0main\0");
+        // terminator
+        buf.push(0);
+
+        // Length prefix (4 bytes for length + payload)
+        let len = (4 + buf.len()) as i32;
+        self.stream.write_all(&len.to_be_bytes()).unwrap();
+        self.stream.write_all(&buf).unwrap();
+        self.stream.flush().unwrap();
+    }
+
+    /// Send a simple query message ('Q')
+    fn send_query(&mut self, sql: &str) {
+        let payload = format!("{sql}\0");
+        let len = (4 + payload.len()) as i32;
+        self.stream.write_all(b"Q").unwrap();
+        self.stream.write_all(&len.to_be_bytes()).unwrap();
+        self.stream.write_all(payload.as_bytes()).unwrap();
+        self.stream.flush().unwrap();
+    }
+
+    /// Read all messages until ReadyForQuery ('Z'), return raw bytes.
+    fn read_until_ready(&mut self) -> Vec<u8> {
+        let mut all_bytes = Vec::new();
+        loop {
+            let mut tag = [0u8; 1];
+            if self.stream.read_exact(&mut tag).is_err() {
+                break;
+            }
+            let mut len_buf = [0u8; 4];
+            self.stream.read_exact(&mut len_buf).unwrap();
+            let len = i32::from_be_bytes(len_buf) as usize;
+            let mut body = vec![0u8; len - 4];
+            if !body.is_empty() {
+                self.stream.read_exact(&mut body).unwrap();
+            }
+            all_bytes.push(tag[0]);
+            all_bytes.extend_from_slice(&len_buf);
+            all_bytes.extend_from_slice(&body);
+
+            // 'Z' = ReadyForQuery
+            if tag[0] == b'Z' {
+                break;
+            }
+        }
+        all_bytes
+    }
+
+    /// Send query and return command tag strings from CommandComplete ('C') messages.
+    fn query_command_tags(&mut self, sql: &str) -> Vec<String> {
+        self.send_query(sql);
+        let response = self.read_until_ready();
+        extract_command_tags(&response)
+    }
+}
+
+/// Extract CommandComplete ('C') tag strings from raw PG wire bytes.
+fn extract_command_tags(data: &[u8]) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let tag = data[pos];
+        pos += 1;
+        if pos + 4 > data.len() {
+            break;
+        }
+        let len =
+            i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let body_len = len - 4;
+        if pos + body_len > data.len() {
+            break;
+        }
+        if tag == b'C' {
+            // CommandComplete body is a null-terminated string
+            let s = String::from_utf8_lossy(&data[pos..pos + body_len]);
+            let s = s.trim_end_matches('\0').to_string();
+            tags.push(s);
+        }
+        pos += body_len;
+    }
+    tags
+}
+
+#[test]
+fn wire_copy_from_returns_copy_n() {
+    // Use a unique port to avoid conflicts with parallel tests
+    let port = 15432 + (std::process::id() % 1000) as u16;
+    let mut server = start_pgmicro_server(port);
+
+    let path = write_temp_copy_file("wire", "1\tAlice\n2\tBob\n3\tCharlie\n");
+
+    let mut client = PgTestClient::connect(port);
+
+    // Create table
+    let tags = client.query_command_tags("CREATE TABLE users(id INT, name TEXT)");
+    assert!(
+        tags.iter().any(|t| t.contains("CREATE")),
+        "expected CREATE tag, got: {tags:?}"
+    );
+
+    // COPY FROM
+    let copy_sql = format!("COPY users FROM '{}'", path.display());
+    let tags = client.query_command_tags(&copy_sql);
+    assert!(
+        tags.iter().any(|t| t == "COPY 3"),
+        "expected 'COPY 3' tag, got: {tags:?}"
+    );
+
+    // Verify data via SELECT
+    let tags = client.query_command_tags("SELECT id, name FROM users ORDER BY id");
+    // SELECT produces a CommandComplete like "SELECT 3"
+    assert!(
+        tags.iter().any(|t| t.starts_with("SELECT")),
+        "expected SELECT tag, got: {tags:?}"
+    );
+
+    std::fs::remove_file(&path).ok();
+    server.kill().ok();
+    server.wait().ok();
 }

@@ -311,6 +311,56 @@ pub enum Stmt {
         /// index name (None means optimize all indexes)
         idx_name: Option<QualifiedName>,
     },
+    /// `COPY table FROM/TO source`
+    Copy {
+        /// table name
+        table_name: QualifiedName,
+        /// optional column list
+        columns: Option<Vec<Name>>,
+        /// FROM or TO
+        direction: CopyDirection,
+        /// file path, stdin, stdout, or program
+        target: CopyTarget,
+        /// text, csv, or binary
+        format: CopyFormat,
+        /// column delimiter
+        delimiter: Option<String>,
+        /// first line is header
+        header: bool,
+        /// string representing NULL
+        null_string: Option<String>,
+        /// quote character (CSV)
+        quote: Option<String>,
+        /// escape character (CSV)
+        escape: Option<String>,
+    },
+}
+
+/// Direction of a `COPY` statement
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CopyDirection {
+    From,
+    To,
+}
+
+/// Target of a `COPY` statement
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CopyTarget {
+    Stdin,
+    Stdout,
+    File(String),
+    Program(String),
+}
+
+/// Format for a `COPY` statement
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CopyFormat {
+    Text,
+    Csv,
+    Binary,
 }
 
 #[repr(transparent)]

@@ -186,6 +186,12 @@ impl Statement {
             .load(crate::sync::atomic::Ordering::SeqCst)
     }
 
+    pub fn set_n_change(&self, n: i64) {
+        self.state
+            .n_change
+            .store(n, crate::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
         self.program.connection.set_mv_tx(mv_tx);
     }
