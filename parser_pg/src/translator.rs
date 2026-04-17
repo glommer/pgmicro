@@ -1743,11 +1743,22 @@ impl PostgreSQLTranslator {
                         } else if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) =
                             &val.node
                         {
-                            // Check if this is a column reference with "*"
-                            if let Some(field) = col_ref.fields.first() {
-                                if let Some(pg_query::protobuf::node::Node::AStar(_)) = &field.node
-                                {
-                                    result_columns.push(ast::ResultColumn::Star);
+                            // Check if this is a star reference (* or table.*)
+                            if let Some(last) = col_ref.fields.last() {
+                                if let Some(pg_query::protobuf::node::Node::AStar(_)) = &last.node {
+                                    if col_ref.fields.len() == 1 {
+                                        // SELECT *
+                                        result_columns.push(ast::ResultColumn::Star);
+                                    } else if let Some(first) = col_ref.fields.first() {
+                                        // SELECT table.* or alias.*
+                                        if let Some(pg_query::protobuf::node::Node::String(s)) =
+                                            &first.node
+                                        {
+                                            result_columns.push(ast::ResultColumn::TableStar(
+                                                ast::Name::from_string(&s.sval),
+                                            ));
+                                        }
+                                    }
                                     continue;
                                 }
                             }
