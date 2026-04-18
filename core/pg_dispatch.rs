@@ -7,12 +7,17 @@
 //! Extracted from `connection.rs` so that merges from upstream Turso
 //! never conflict with PG-only code.
 
+use std::num::NonZero;
+
 use crate::connection::Connection;
+use crate::copy::parse_copy_text_format;
 use crate::statement::StatementOrigin;
+use crate::types::Text;
 use crate::{Cmd, LimboError, Result, SqlDialect, Statement, Value};
 use turso_parser_pg::translator::{
-    is_refresh_matview, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
-    try_extract_show, PgCreateSchemaStmt, PgDropSchemaStmt, PostgreSQLTranslator,
+    is_refresh_matview, try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema,
+    try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PostgreSQLTranslator,
 };
 
 use crate::sync::Arc;
@@ -68,6 +73,14 @@ impl Connection {
         // REFRESH MATERIALIZED VIEW → no-op (Turso matviews are live)
         if is_refresh_matview(&parse_result) {
             return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
+        // COPY table FROM '/path/to/file' → read file, INSERT rows
+        if let Some(copy_stmt) = try_extract_copy_from(&parse_result) {
+            let rows_inserted = self.handle_pg_copy_from(&copy_stmt)?;
+            let stmt = self.prepare_sqlite_sql("SELECT 0 WHERE 0")?;
+            stmt.set_n_change(rows_inserted as i64);
+            return Ok(Some(stmt));
         }
 
         Ok(None)
@@ -184,6 +197,111 @@ impl Connection {
         })();
         self.set_sql_dialect(saved_dialect);
         result
+    }
+
+    /// Handle COPY FROM file: read tab-delimited data and INSERT rows.
+    /// Returns the number of rows inserted.
+    fn handle_pg_copy_from(self: &Arc<Self>, stmt: &PgCopyFromStmt) -> Result<usize> {
+        let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
+            LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
+        })?;
+
+        // Determine column info from table
+        let table_name = match &stmt.schema_name {
+            Some(schema) => format!("\"{schema}\".\"{name}\"", name = stmt.table_name),
+            None => format!("\"{}\"", stmt.table_name),
+        };
+        let column_names = self.get_table_columns(&stmt.table_name, stmt.schema_name.as_deref())?;
+        if column_names.is_empty() {
+            return Err(LimboError::ParseError(format!(
+                "COPY FROM: table '{}' not found or has no columns",
+                stmt.table_name
+            )));
+        }
+
+        // If specific columns are listed, use those; otherwise use all table columns
+        let (insert_cols, num_columns) = match &stmt.columns {
+            Some(cols) => {
+                let col_list = cols
+                    .iter()
+                    .map(|c| format!("\"{c}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (format!(" ({col_list})"), cols.len())
+            }
+            None => (String::new(), column_names.len()),
+        };
+
+        let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
+        let insert_sql = format!("INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})");
+
+        let delimiter = stmt
+            .delimiter
+            .as_ref()
+            .and_then(|d| d.chars().next())
+            .unwrap_or('\t');
+        let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
+
+        let mut rows = parse_copy_text_format(&data, delimiter, null_string, num_columns)?;
+
+        // Skip header row if requested
+        if stmt.header && !rows.is_empty() {
+            rows.remove(0);
+        }
+
+        let rows_inserted = rows.len();
+
+        // Execute inserts with SQLite dialect, wrapped in a transaction
+        let saved_dialect = self.get_sql_dialect();
+        self.set_sql_dialect(SqlDialect::Sqlite);
+        let result = (|| {
+            let mut begin = self.prepare_with_origin("BEGIN", StatementOrigin::Root)?;
+            begin.run_ignore_rows()?;
+
+            let mut insert_stmt = self.prepare_with_origin(&insert_sql, StatementOrigin::Root)?;
+
+            for row in &rows {
+                for (i, val) in row.iter().enumerate() {
+                    let index = NonZero::new(i + 1).unwrap();
+                    match val {
+                        Some(s) => insert_stmt.bind_at(index, Value::Text(Text::new(s.clone()))),
+                        None => insert_stmt.bind_at(index, Value::Null),
+                    }
+                }
+                insert_stmt.run_ignore_rows()?;
+                insert_stmt.reset()?;
+                insert_stmt.clear_bindings();
+            }
+
+            let mut commit = self.prepare_with_origin("COMMIT", StatementOrigin::Root)?;
+            commit.run_ignore_rows()?;
+
+            Ok(rows_inserted)
+        })();
+        self.set_sql_dialect(saved_dialect);
+        result
+    }
+
+    /// Get column names for a table using PRAGMA table_info.
+    fn get_table_columns(
+        self: &Arc<Self>,
+        table_name: &str,
+        schema_name: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let sql = match schema_name {
+            Some(schema) => format!("PRAGMA \"{schema}\".table_info('{table_name}')"),
+            None => format!("PRAGMA table_info('{table_name}')"),
+        };
+        let mut stmt = self.prepare_internal(&sql)?;
+        let rows = stmt.run_collect_rows()?;
+        // table_info returns: cid, name, type, notnull, dflt_value, pk
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| match row.get(1) {
+                Some(Value::Text(t)) => Some(t.as_str().to_string()),
+                _ => None,
+            })
+            .collect())
     }
 
     /// List user-visible table names in a schema.

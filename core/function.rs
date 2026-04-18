@@ -556,6 +556,18 @@ pub enum ScalarFunc {
     ArrayToString,
     ArrayOverlap,
     ArrayContainsAll,
+    // PostgreSQL math functions
+    Gcd,
+    Lcm,
+    // PostgreSQL string functions
+    Repeat,
+    // PostgreSQL formatting
+    ToChar,
+    // PostgreSQL input validation
+    PgInputIsValid,
+    // PostgreSQL boolean operator functions
+    BoolEq,
+    BoolNe,
 }
 
 impl Deterministic for ScalarFunc {
@@ -677,6 +689,13 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::ArrayToString
             | ScalarFunc::ArrayOverlap
             | ScalarFunc::ArrayContainsAll => true,
+            ScalarFunc::Gcd
+            | ScalarFunc::Lcm
+            | ScalarFunc::Repeat
+            | ScalarFunc::ToChar
+            | ScalarFunc::PgInputIsValid
+            | ScalarFunc::BoolEq
+            | ScalarFunc::BoolNe => true,
         }
     }
 }
@@ -823,6 +842,13 @@ impl Display for ScalarFunc {
             Self::ArrayToString => "array_to_string",
             Self::ArrayOverlap => "array_overlap",
             Self::ArrayContainsAll => "array_contains_all",
+            Self::Gcd => "gcd",
+            Self::Lcm => "lcm",
+            Self::Repeat => "repeat",
+            Self::ToChar => "to_char",
+            Self::PgInputIsValid => "pg_input_is_valid",
+            Self::BoolEq => "booleq",
+            Self::BoolNe => "boolne",
         };
         write!(f, "{str}")
     }
@@ -971,6 +997,13 @@ impl ScalarFunc {
             Self::ArraySlice => &[3],
             Self::StringToArray => &[2, 3],
             Self::ArrayToString => &[2, 3],
+            Self::Gcd
+            | Self::Lcm
+            | Self::Repeat
+            | Self::ToChar
+            | Self::PgInputIsValid
+            | Self::BoolEq
+            | Self::BoolNe => &[2],
         }
     }
 
@@ -1351,6 +1384,13 @@ impl Func {
             "pg_type_is_visible" => Ok(Some(Self::Scalar(ScalarFunc::PgTypeIsVisible))),
             "lpad" => Ok(Some(Self::Scalar(ScalarFunc::Lpad))),
             "rpad" => Ok(Some(Self::Scalar(ScalarFunc::Rpad))),
+            "gcd" => Ok(Some(Self::Scalar(ScalarFunc::Gcd))),
+            "lcm" => Ok(Some(Self::Scalar(ScalarFunc::Lcm))),
+            "repeat" => Ok(Some(Self::Scalar(ScalarFunc::Repeat))),
+            "to_char" => Ok(Some(Self::Scalar(ScalarFunc::ToChar))),
+            "pg_input_is_valid" => Ok(Some(Self::Scalar(ScalarFunc::PgInputIsValid))),
+            "booleq" => Ok(Some(Self::Scalar(ScalarFunc::BoolEq))),
+            "boolne" => Ok(Some(Self::Scalar(ScalarFunc::BoolNe))),
             "abs" => Ok(Some(Self::Scalar(ScalarFunc::Abs))),
             "upper" => Ok(Some(Self::Scalar(ScalarFunc::Upper))),
             "lower" => Ok(Some(Self::Scalar(ScalarFunc::Lower))),

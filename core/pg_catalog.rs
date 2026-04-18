@@ -2775,7 +2775,569 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
         empty_catalog_table("pg_publication", "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER)"),
         empty_catalog_table("pg_publication_namespace", "CREATE TABLE pg_publication_namespace (oid INTEGER, pnpubid INTEGER, pnnspid INTEGER)"),
         empty_catalog_table("pg_publication_rel", "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT)"),
+        // pg_input_error_info table-valued function
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_input_error_info".to_string(),
+                PgInputErrorInfoTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgInputErrorInfoTable::new())),
+            )
+            .expect("pg_input_error_info virtual table creation should not fail"),
+        ),
     ]
+}
+
+/// Table-valued function: `pg_input_error_info(input TEXT, type TEXT)`
+///
+/// Returns one row with columns (message, detail, hint, sql_error_code).
+/// If the input is valid for the given type, all columns are NULL.
+/// If invalid, message and sql_error_code describe the error.
+#[derive(Debug)]
+struct PgInputErrorInfoTable;
+
+impl PgInputErrorInfoTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+struct PgInputErrorInfoCursor {
+    row: Option<[Value; 4]>,
+    returned: bool,
+}
+
+impl PgInputErrorInfoCursor {
+    fn new() -> Self {
+        Self {
+            row: None,
+            returned: false,
+        }
+    }
+}
+
+/// Validate input for a PostgreSQL type, returning error info if invalid.
+///
+/// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
+/// Used by both `pg_input_error_info` (table-valued) and `pg_input_is_valid` (scalar).
+pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, String)> {
+    let trimmed = input.trim();
+
+    // Extract base type and optional length modifier, e.g. "varchar(4)" → ("varchar", Some(4))
+    let (base_type, type_mod) = match type_name.find('(') {
+        Some(pos) => {
+            let base = type_name[..pos].trim();
+            let mod_str = type_name[pos + 1..].trim_end_matches(')').trim();
+            let modifier = mod_str.parse::<usize>().ok();
+            (base.to_lowercase(), modifier)
+        }
+        None => (type_name.to_lowercase(), None),
+    };
+
+    match base_type.as_str() {
+        "bool" | "boolean" => {
+            let lower = trimmed.to_lowercase();
+            let valid = matches!(
+                lower.as_str(),
+                "t" | "true" | "y" | "yes" | "on" | "1" | "f" | "false" | "n" | "no" | "off" | "0"
+            );
+            if valid {
+                None
+            } else {
+                Some((
+                    format!("invalid input syntax for type boolean: \"{input}\""),
+                    "22P02".to_string(),
+                ))
+            }
+        }
+        "int2" | "smallint" => match trimmed.parse::<i64>() {
+            Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => Some((
+                format!("value \"{input}\" is out of range for type smallint"),
+                "22003".to_string(),
+            )),
+            Ok(_) => None,
+            Err(_) => Some((
+                format!("invalid input syntax for type smallint: \"{input}\""),
+                "22P02".to_string(),
+            )),
+        },
+        "int4" | "integer" | "int" => match trimmed.parse::<i64>() {
+            Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Some((
+                format!("value \"{input}\" is out of range for type integer"),
+                "22003".to_string(),
+            )),
+            Ok(_) => None,
+            Err(_) => Some((
+                format!("invalid input syntax for type integer: \"{input}\""),
+                "22P02".to_string(),
+            )),
+        },
+        "int8" | "bigint" => match trimmed.parse::<i64>() {
+            Ok(_) => None,
+            Err(_) => {
+                if trimmed.parse::<i128>().is_ok() {
+                    Some((
+                        format!("value \"{input}\" is out of range for type bigint"),
+                        "22003".to_string(),
+                    ))
+                } else {
+                    Some((
+                        format!("invalid input syntax for type bigint: \"{input}\""),
+                        "22P02".to_string(),
+                    ))
+                }
+            }
+        },
+        "float4" | "real" => match trimmed.parse::<f32>() {
+            Ok(v) if v.is_infinite() => Some((
+                format!("value \"{input}\" is out of range for type real"),
+                "22003".to_string(),
+            )),
+            Ok(_) => None,
+            Err(_) => Some((
+                format!("invalid input syntax for type real: \"{input}\""),
+                "22P02".to_string(),
+            )),
+        },
+        "float8" | "double precision" => match trimmed.parse::<f64>() {
+            Ok(v) if v.is_infinite() => Some((
+                format!("value \"{input}\" is out of range for type double precision"),
+                "22003".to_string(),
+            )),
+            Ok(_) => None,
+            Err(_) => Some((
+                format!("invalid input syntax for type double precision: \"{input}\""),
+                "22P02".to_string(),
+            )),
+        },
+        "numeric" | "decimal" => match trimmed.parse::<f64>() {
+            Ok(v) if v.is_nan() || v.is_infinite() => Some((
+                format!("invalid input syntax for type numeric: \"{input}\""),
+                "22P02".to_string(),
+            )),
+            Ok(_) => None,
+            Err(_) => Some((
+                format!("invalid input syntax for type numeric: \"{input}\""),
+                "22P02".to_string(),
+            )),
+        },
+        "text" => None,
+        "varchar" | "character varying" => {
+            if let Some(max_len) = type_mod {
+                if trimmed.chars().count() > max_len {
+                    return Some((
+                        format!("value too long for type character varying({max_len})"),
+                        "22001".to_string(),
+                    ));
+                }
+            }
+            None
+        }
+        "char" | "character" => {
+            if let Some(max_len) = type_mod {
+                if trimmed.chars().count() > max_len {
+                    return Some((
+                        format!("value too long for type character({max_len})"),
+                        "22001".to_string(),
+                    ));
+                }
+            }
+            None
+        }
+        "uuid" => {
+            let hex: String = trimmed.chars().filter(|c| *c != '-').collect();
+            if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                Some((
+                    format!("invalid input syntax for type uuid: \"{input}\""),
+                    "22P02".to_string(),
+                ))
+            } else {
+                None
+            }
+        }
+        "date" => {
+            // Accept YYYY-MM-DD
+            let parts: Vec<&str> = trimmed.split('-').collect();
+            if parts.len() == 3
+                && parts[0].parse::<i32>().is_ok()
+                && parts[1].parse::<u32>().is_ok_and(|m| (1..=12).contains(&m))
+                && parts[2].parse::<u32>().is_ok_and(|d| (1..=31).contains(&d))
+            {
+                None
+            } else {
+                Some((
+                    format!("invalid input syntax for type date: \"{input}\""),
+                    "22007".to_string(),
+                ))
+            }
+        }
+        "timestamp" | "timestamp without time zone" => {
+            // Accept YYYY-MM-DD HH:MM:SS[.fff]
+            if parse_timestamp_prefix(trimmed).is_some() {
+                None
+            } else {
+                Some((
+                    format!("invalid input syntax for type timestamp: \"{input}\""),
+                    "22007".to_string(),
+                ))
+            }
+        }
+        "timestamptz" | "timestamp with time zone" => {
+            // Accept YYYY-MM-DD HH:MM:SS[.fff][+/-HH[:MM]]
+            let (base, _tz) = match trimmed.rfind('+') {
+                Some(pos) if pos > 10 => (&trimmed[..pos], Some(&trimmed[pos..])),
+                _ => match trimmed.rfind('-') {
+                    Some(pos) if pos > 10 => (&trimmed[..pos], Some(&trimmed[pos..])),
+                    _ => (trimmed, None),
+                },
+            };
+            if parse_timestamp_prefix(base).is_some() {
+                None
+            } else {
+                Some((
+                    format!("invalid input syntax for type timestamp with time zone: \"{input}\""),
+                    "22007".to_string(),
+                ))
+            }
+        }
+        "time" | "time without time zone" => {
+            // Accept HH:MM:SS[.fff]
+            let time_part = trimmed.split('.').next().unwrap_or(trimmed);
+            let parts: Vec<&str> = time_part.split(':').collect();
+            if parts.len() >= 2
+                && parts.len() <= 3
+                && parts[0].parse::<u32>().is_ok_and(|h| (0..=23).contains(&h))
+                && parts[1].parse::<u32>().is_ok_and(|m| (0..=59).contains(&m))
+                && (parts.len() < 3 || parts[2].parse::<u32>().is_ok_and(|s| (0..=59).contains(&s)))
+            {
+                None
+            } else {
+                Some((
+                    format!("invalid input syntax for type time: \"{input}\""),
+                    "22007".to_string(),
+                ))
+            }
+        }
+        "json" | "jsonb" => {
+            if is_valid_json(trimmed) {
+                None
+            } else {
+                let type_label = if base_type == "jsonb" {
+                    "jsonb"
+                } else {
+                    "json"
+                };
+                Some((
+                    format!("invalid input syntax for type {type_label}: \"{input}\""),
+                    "22P02".to_string(),
+                ))
+            }
+        }
+        "bytea" => {
+            // Accept \x hex format
+            if let Some(hex) = trimmed.strip_prefix("\\x") {
+                if hex.len() % 2 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    None
+                } else {
+                    Some((
+                        format!("invalid input syntax for type bytea: \"{input}\""),
+                        "22P02".to_string(),
+                    ))
+                }
+            } else {
+                // Plain text is valid bytea input (escape format)
+                None
+            }
+        }
+        "inet" | "cidr" => {
+            // Accept IP address with optional /prefix
+            let addr_part = trimmed.split('/').next().unwrap_or(trimmed);
+            if addr_part.parse::<std::net::IpAddr>().is_ok() {
+                // If there's a prefix, validate it
+                if let Some(prefix_str) = trimmed.split('/').nth(1) {
+                    if prefix_str.parse::<u8>().is_err() {
+                        return Some((
+                            format!("invalid input syntax for type {base_type}: \"{input}\""),
+                            "22P02".to_string(),
+                        ));
+                    }
+                }
+                None
+            } else {
+                Some((
+                    format!("invalid input syntax for type {base_type}: \"{input}\""),
+                    "22P02".to_string(),
+                ))
+            }
+        }
+        "macaddr" => {
+            let parts: Vec<&str> = trimmed.split(':').collect();
+            if parts.len() == 6
+                && parts
+                    .iter()
+                    .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+            {
+                None
+            } else {
+                Some((
+                    format!("invalid input syntax for type macaddr: \"{input}\""),
+                    "22P02".to_string(),
+                ))
+            }
+        }
+        "oid" => {
+            if trimmed.parse::<u32>().is_ok() {
+                None
+            } else {
+                Some((
+                    format!("invalid input syntax for type oid: \"{input}\""),
+                    "22P02".to_string(),
+                ))
+            }
+        }
+        _ => Some((
+            format!("type \"{type_name}\" does not exist"),
+            "42704".to_string(),
+        )),
+    }
+}
+
+/// Parse a YYYY-MM-DD HH:MM:SS[.fff] prefix, returning Some(()) if valid.
+fn parse_timestamp_prefix(s: &str) -> Option<()> {
+    let parts: Vec<&str> = s.splitn(2, [' ', 'T']).collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    // Validate date part
+    let date_parts: Vec<&str> = parts[0].split('-').collect();
+    if date_parts.len() != 3
+        || date_parts[0].parse::<i32>().is_err()
+        || !date_parts[1]
+            .parse::<u32>()
+            .is_ok_and(|m| (1..=12).contains(&m))
+        || !date_parts[2]
+            .parse::<u32>()
+            .is_ok_and(|d| (1..=31).contains(&d))
+    {
+        return None;
+    }
+    // Validate time part (strip fractional seconds)
+    let time_str = parts[1].split('.').next().unwrap_or(parts[1]);
+    let time_parts: Vec<&str> = time_str.split(':').collect();
+    if time_parts.len() < 2
+        || time_parts.len() > 3
+        || !time_parts[0]
+            .parse::<u32>()
+            .is_ok_and(|h| (0..=23).contains(&h))
+        || !time_parts[1]
+            .parse::<u32>()
+            .is_ok_and(|m| (0..=59).contains(&m))
+    {
+        return None;
+    }
+    if time_parts.len() == 3
+        && !time_parts[2]
+            .parse::<u32>()
+            .is_ok_and(|s| (0..=59).contains(&s))
+    {
+        return None;
+    }
+    Some(())
+}
+
+/// Minimal JSON validation without requiring serde_json.
+fn is_valid_json(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Quick structural check: must start with {, [, ", digit, true, false, or null
+    let first = trimmed.as_bytes()[0];
+    match first {
+        b'{' => trimmed.ends_with('}') && validate_json_braces(trimmed),
+        b'[' => trimmed.ends_with(']') && validate_json_braces(trimmed),
+        b'"' => trimmed.len() >= 2 && trimmed.ends_with('"'),
+        b't' => trimmed == "true",
+        b'f' => trimmed == "false",
+        b'n' => trimmed == "null",
+        b'0'..=b'9' | b'-' => trimmed.parse::<f64>().is_ok(),
+        _ => false,
+    }
+}
+
+/// Check that braces/brackets are balanced in a JSON string.
+fn validate_json_braces(s: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in s.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match ch {
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    stack.is_empty() && !in_string
+}
+
+impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.returned = true;
+        Ok(false)
+    }
+
+    fn rowid(&self) -> i64 {
+        0
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        match &self.row {
+            Some(row) if column < 4 => Ok(row[column].clone()),
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn filter(
+        &mut self,
+        args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.returned = false;
+
+        if args.len() < 2 {
+            // Not enough arguments — return one row of NULLs
+            self.row = Some([Value::Null, Value::Null, Value::Null, Value::Null]);
+            return Ok(true);
+        }
+
+        let input = match &args[0] {
+            Value::Text(t) => t.as_str().to_string(),
+            Value::Null => {
+                self.row = Some([Value::Null, Value::Null, Value::Null, Value::Null]);
+                return Ok(true);
+            }
+            v => v.to_string(),
+        };
+
+        let type_name = match &args[1] {
+            Value::Text(t) => t.as_str().to_string(),
+            _ => {
+                self.row = Some([Value::Null, Value::Null, Value::Null, Value::Null]);
+                return Ok(true);
+            }
+        };
+
+        self.row = Some(match validate_pg_input(&input, &type_name) {
+            Some((message, code)) => [
+                Value::build_text(message),
+                Value::Null,
+                Value::Null,
+                Value::build_text(code),
+            ],
+            None => [Value::Null, Value::Null, Value::Null, Value::Null],
+        });
+
+        Ok(true)
+    }
+}
+
+impl InternalVirtualTable for PgInputErrorInfoTable {
+    fn name(&self) -> String {
+        "pg_input_error_info".to_string()
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_input_error_info (
+            message TEXT,
+            detail TEXT,
+            hint TEXT,
+            sql_error_code TEXT,
+            input TEXT HIDDEN,
+            type_name TEXT HIDDEN
+        )"
+        .to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgInputErrorInfoCursor::new())))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        use turso_ext::{ConstraintOp, ConstraintUsage};
+
+        let mut usages = vec![
+            ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            };
+            constraints.len()
+        ];
+
+        // Hidden columns: input (col 4) and type_name (col 5)
+        let mut input_idx = None;
+        let mut type_idx = None;
+        for (i, c) in constraints.iter().enumerate() {
+            if c.op != ConstraintOp::Eq || !c.usable {
+                continue;
+            }
+            match c.column_index as usize {
+                4 => input_idx = Some(i),
+                5 => type_idx = Some(i),
+                _ => {}
+            }
+        }
+
+        if let Some(i) = input_idx {
+            usages[i] = ConstraintUsage {
+                argv_index: Some(1),
+                omit: true,
+            };
+        }
+        if let Some(i) = type_idx {
+            usages[i] = ConstraintUsage {
+                argv_index: Some(2),
+                omit: true,
+            };
+        }
+
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1.0,
+            estimated_rows: 1,
+            constraint_usages: usages,
+        })
+    }
 }
 
 /// Virtual table for getting PostgreSQL-compatible CREATE TABLE statements

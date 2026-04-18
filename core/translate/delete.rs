@@ -150,7 +150,15 @@ pub fn prepare_delete_plan(
     let schema = resolver.schema();
     let table = match resolver.with_schema(database_id, |s| s.get_table(&table_name)) {
         Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", table_name),
+        None => {
+            if resolver
+                .with_schema(database_id, |s| s.get_postgres_table(&table_name))
+                .is_some()
+            {
+                crate::bail_parse_error!("cannot delete from pg_catalog table \"{}\"", table_name);
+            }
+            crate::bail_parse_error!("no such table: {}", table_name);
+        }
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", table_name);

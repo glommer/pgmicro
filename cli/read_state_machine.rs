@@ -89,6 +89,41 @@ impl<'a> Iterator for Tokenizer<'a> {
                         .for_each(drop);
                     continue;
                 }
+                '$' => {
+                    // Try to read a dollar-quote tag: $<optional_ident>$
+                    let mut tag = String::from('$');
+                    let is_dollar_quote = loop {
+                        match self.chars.peek() {
+                            Some(&'$') => {
+                                tag.push(self.chars.next().unwrap());
+                                break true;
+                            }
+                            Some(&ch)
+                                if ch == '_'
+                                    || ch.is_ascii_alphabetic()
+                                    || (tag.len() > 1 && ch.is_ascii_digit()) =>
+                            {
+                                tag.push(self.chars.next().unwrap());
+                            }
+                            _ => break false, // bare $ or $1 etc.
+                        }
+                    };
+                    if is_dollar_quote {
+                        // Consume everything until the matching closing tag
+                        let tag_bytes = tag.as_bytes();
+                        let tag_len = tag_bytes.len();
+                        let mut buf = Vec::new();
+                        for ch in self.chars.by_ref() {
+                            buf.push(ch as u8);
+                            if buf.len() >= tag_len && buf[buf.len() - tag_len..] == *tag_bytes {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    // Not a dollar-quote (e.g. $1 positional param) — treat as other
+                    Token::TkOther
+                }
                 // Handle Comments
                 '-' if self.chars.peek() == Some(&'-') => {
                     self.chars.next(); // Consume second `-`
@@ -350,6 +385,50 @@ mod tests {
         assert!(!is_complete(
             "create virtual table t1 using csv(data=\"12');"
         ));
+    }
+
+    #[test]
+    fn test_dollar_quoted_string() {
+        assert!(is_complete("SELECT $$hello;world$$;"));
+        assert!(!is_complete("SELECT $$hello;world$$"));
+    }
+
+    #[test]
+    fn test_create_function_dollar_quoted() {
+        let func = r#"
+            CREATE FUNCTION test() RETURNS integer AS $$
+            BEGIN
+                RETURN 1;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        assert!(is_complete(func));
+    }
+
+    #[test]
+    fn test_create_function_incomplete_dollar_quote() {
+        let func = r#"
+            CREATE FUNCTION test() RETURNS integer AS $$
+            BEGIN
+                RETURN 1;
+            END;
+        "#;
+        assert!(!is_complete(func));
+    }
+
+    #[test]
+    fn test_dollar_quoted_with_tag() {
+        assert!(is_complete("SELECT $body$hello;world$body$;"));
+        assert!(!is_complete("SELECT $body$hello;world$body$"));
+        // Mismatched tags — inner $fn$ doesn't close $body$
+        assert!(!is_complete("SELECT $body$hello;world$fn$;"));
+    }
+
+    #[test]
+    fn test_dollar_sign_not_quote() {
+        // Positional params are not dollar-quotes
+        assert!(is_complete("SELECT $1;"));
+        assert!(!is_complete("SELECT $1"));
     }
 }
 

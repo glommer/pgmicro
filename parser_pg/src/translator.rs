@@ -27,17 +27,23 @@ impl PostgreSQLTranslator {
     ) -> ast::QualifiedName {
         let mapped_name = self.map_table_name(&range_var.relname);
         let name = ast::Name::from_string(mapped_name);
-        if range_var.schemaname.is_empty()
+        let alias = range_var
+            .alias
+            .as_ref()
+            .filter(|a| !a.aliasname.is_empty())
+            .map(|a| ast::Name::from_string(&a.aliasname));
+        let mut qn = if range_var.schemaname.is_empty()
             || matches!(
                 range_var.schemaname.to_lowercase().as_str(),
                 "pg_catalog" | "public" | "information_schema"
-            )
-        {
+            ) {
             ast::QualifiedName::single(name)
         } else {
             let schema = ast::Name::from_string(range_var.schemaname.clone());
             ast::QualifiedName::fullname(schema, name)
-        }
+        };
+        qn.alias = alias;
+        qn
     }
 
     /// Maps PostgreSQL system table names to their Turso equivalents.
@@ -105,6 +111,7 @@ impl PostgreSQLTranslator {
             NodeRef::ViewStmt(view) => self.translate_create_view(view),
             NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas),
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt),
+            NodeRef::CopyStmt(copy) => self.translate_copy(copy),
             _ => Err(ParseError::ParseError(format!(
                 "{} is not supported",
                 node_ref_name(&node.0)
@@ -307,13 +314,23 @@ impl PostgreSQLTranslator {
             }
         }
 
-        // Build the type
+        // Build the type with size parameters (e.g. varchar(4), numeric(10,2))
         let col_type = if mapping.type_name.is_empty() {
             None
         } else {
+            let size = match mapping.type_params.as_slice() {
+                [p, s] => Some(ast::TypeSize::TypeSize(
+                    Box::new(ast::Expr::Literal(ast::Literal::Numeric(p.to_string()))),
+                    Box::new(ast::Expr::Literal(ast::Literal::Numeric(s.to_string()))),
+                )),
+                [n] => Some(ast::TypeSize::MaxSize(Box::new(ast::Expr::Literal(
+                    ast::Literal::Numeric(n.to_string()),
+                )))),
+                _ => None,
+            };
             Some(ast::Type {
                 name: mapping.type_name.clone(),
-                size: None,
+                size,
                 array_dimensions: mapping.array_dimensions,
             })
         };
@@ -631,9 +648,19 @@ impl PostgreSQLTranslator {
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
         })?;
+        let size = match mapping.type_params.as_slice() {
+            [p, s] => Some(ast::TypeSize::TypeSize(
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric(p.to_string()))),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric(s.to_string()))),
+            )),
+            [n] => Some(ast::TypeSize::MaxSize(Box::new(ast::Expr::Literal(
+                ast::Literal::Numeric(n.to_string()),
+            )))),
+            _ => None,
+        };
         let col_type = Some(ast::Type {
             name: mapping.type_name,
-            size: None,
+            size,
             array_dimensions: mapping.array_dimensions,
         });
 
@@ -1219,6 +1246,35 @@ impl PostgreSQLTranslator {
             return self.translate_set_operation(select);
         }
 
+        // VALUES clause: standalone VALUES (1,'a'), (2,'b') ...
+        if !select.values_lists.is_empty() && select.target_list.is_empty() {
+            let mut rows = Vec::new();
+            for row_node in &select.values_lists {
+                let Some(pg_query::protobuf::node::Node::List(list)) = &row_node.node else {
+                    return Err(ParseError::ParseError(
+                        "VALUES: expected list node".to_string(),
+                    ));
+                };
+                let mut exprs = Vec::new();
+                for item in &list.items {
+                    exprs.push(Box::new(self.translate_expr(item)?));
+                }
+                rows.push(exprs);
+            }
+            let body = ast::SelectBody {
+                select: ast::OneSelect::Values(rows),
+                compounds: vec![],
+            };
+            let order_by = self.translate_order_by(&select.sort_clause)?;
+            let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+            return Ok(ast::Select {
+                with: None,
+                body,
+                order_by,
+                limit,
+            });
+        }
+
         // Regular SELECT — translate FROM, columns, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT
         let from_clause = if !select.from_clause.is_empty() {
             Some(self.translate_from_items(&select.from_clause)?)
@@ -1429,6 +1485,9 @@ impl PostgreSQLTranslator {
                 }
                 Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
                     self.translate_range_function(range_func)?
+                }
+                Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
+                    self.translate_range_subselect(range_sub)?
                 }
                 other => {
                     return Err(ParseError::ParseError(format!(
@@ -1722,11 +1781,22 @@ impl PostgreSQLTranslator {
                         } else if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) =
                             &val.node
                         {
-                            // Check if this is a column reference with "*"
-                            if let Some(field) = col_ref.fields.first() {
-                                if let Some(pg_query::protobuf::node::Node::AStar(_)) = &field.node
-                                {
-                                    result_columns.push(ast::ResultColumn::Star);
+                            // Check if this is a star reference (* or table.*)
+                            if let Some(last) = col_ref.fields.last() {
+                                if let Some(pg_query::protobuf::node::Node::AStar(_)) = &last.node {
+                                    if col_ref.fields.len() == 1 {
+                                        // SELECT *
+                                        result_columns.push(ast::ResultColumn::Star);
+                                    } else if let Some(first) = col_ref.fields.first() {
+                                        // SELECT table.* or alias.*
+                                        if let Some(pg_query::protobuf::node::Node::String(s)) =
+                                            &first.node
+                                        {
+                                            result_columns.push(ast::ResultColumn::TableStar(
+                                                ast::Name::from_string(&s.sval),
+                                            ));
+                                        }
+                                    }
                                     continue;
                                 }
                             }
@@ -2294,14 +2364,34 @@ impl PostgreSQLTranslator {
             })
             .ok_or_else(|| ParseError::ParseError("Missing operator name".to_string()))?;
 
+        // Handle unary operators (no left expression)
+        if a_expr.lexpr.is_none() {
+            let rhs = a_expr
+                .rexpr
+                .as_ref()
+                .ok_or_else(|| ParseError::ParseError("Missing right expression".into()))?;
+            let operand = self.translate_expr(rhs)?;
+            return match op_name {
+                "+" => Ok(ast::Expr::Unary(
+                    ast::UnaryOperator::Positive,
+                    Box::new(operand),
+                )),
+                "-" => Ok(ast::Expr::Unary(
+                    ast::UnaryOperator::Negative,
+                    Box::new(operand),
+                )),
+                "~" => Ok(ast::Expr::Unary(
+                    ast::UnaryOperator::BitwiseNot,
+                    Box::new(operand),
+                )),
+                _ => Err(ParseError::ParseError(format!(
+                    "Unsupported unary operator: {op_name}"
+                ))),
+            };
+        }
+
         // Translate left and right expressions
-        let left = if let Some(lexpr) = &a_expr.lexpr {
-            Box::new(self.translate_expr(lexpr)?)
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing left expression".to_string(),
-            ));
-        };
+        let left = Box::new(self.translate_expr(a_expr.lexpr.as_ref().unwrap())?);
 
         let right = if let Some(rexpr) = &a_expr.rexpr {
             Box::new(self.translate_expr(rexpr)?)
@@ -2683,6 +2773,27 @@ impl PostgreSQLTranslator {
             .strip_prefix("pg_catalog.")
             .unwrap_or(&func_name)
             .to_string();
+
+        // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
+        let cast_type = match func_name.to_uppercase().as_str() {
+            "FLOAT8" | "FLOAT4" => Some("REAL"),
+            "INT4" | "INT2" | "INT8" => Some("INTEGER"),
+            "BOOL" => Some("BOOLEAN"),
+            "TEXT" => Some("TEXT"),
+            _ => None,
+        };
+        if let Some(type_name) = cast_type {
+            if args.len() == 1 {
+                return Ok(ast::Expr::Cast {
+                    expr: args.into_iter().next().unwrap(),
+                    type_name: Some(ast::Type {
+                        name: type_name.to_string(),
+                        size: None,
+                        array_dimensions: 0,
+                    }),
+                });
+            }
+        }
 
         Ok(ast::Expr::FunctionCall {
             name: ast::Name::from_string(func_name),
@@ -3319,13 +3430,124 @@ impl PostgreSQLTranslator {
             ))),
         }
     }
+
+    fn translate_copy(&self, copy: &pg_query::protobuf::CopyStmt) -> Result<ast::Stmt, ParseError> {
+        let relation = copy
+            .relation
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("COPY: missing table name".into()))?;
+        let table_name = self.qualified_name_from_range_var(relation);
+
+        let columns = if copy.attlist.is_empty() {
+            None
+        } else {
+            let cols: Vec<ast::Name> = copy
+                .attlist
+                .iter()
+                .map(|n| {
+                    let name = match &n.node {
+                        Some(pg_query::protobuf::node::Node::String(s)) => s.sval.clone(),
+                        _ => String::new(),
+                    };
+                    ast::Name::from_string(name)
+                })
+                .collect();
+            Some(cols)
+        };
+
+        let direction = if copy.is_from {
+            ast::CopyDirection::From
+        } else {
+            ast::CopyDirection::To
+        };
+
+        let target = if copy.filename.is_empty() {
+            if copy.is_from {
+                ast::CopyTarget::Stdin
+            } else {
+                ast::CopyTarget::Stdout
+            }
+        } else if copy.is_program {
+            ast::CopyTarget::Program(copy.filename.clone())
+        } else {
+            ast::CopyTarget::File(copy.filename.clone())
+        };
+
+        let mut format = ast::CopyFormat::Text;
+        let mut delimiter = None;
+        let mut header = false;
+        let mut null_string = None;
+        let mut quote = None;
+        let mut escape = None;
+
+        for opt in &copy.options {
+            let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
+                continue;
+            };
+            match def.defname.as_str() {
+                "format" => {
+                    if let Some(val) = def_elem_string_val(def) {
+                        match val.to_lowercase().as_str() {
+                            "csv" => format = ast::CopyFormat::Csv,
+                            "binary" => format = ast::CopyFormat::Binary,
+                            _ => format = ast::CopyFormat::Text,
+                        }
+                    }
+                }
+                "delimiter" => delimiter = def_elem_string_val(def),
+                "header" => header = def_elem_bool_val(def).unwrap_or(true),
+                "null" => null_string = def_elem_string_val(def),
+                "quote" => quote = def_elem_string_val(def),
+                "escape" => escape = def_elem_string_val(def),
+                _ => {}
+            }
+        }
+
+        Ok(ast::Stmt::Copy {
+            table_name,
+            columns,
+            direction,
+            target,
+            format,
+            delimiter,
+            header,
+            null_string,
+            quote,
+            escape,
+        })
+    }
 }
 
-/// Result of mapping a PostgreSQL type: the Turso type name and array dimensions.
+/// Extract a string value from a DefElem's arg.
+fn def_elem_string_val(def: &pg_query::protobuf::DefElem) -> Option<String> {
+    let arg = def.arg.as_deref()?;
+    match &arg.node {
+        Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+        _ => None,
+    }
+}
+
+/// Extract a boolean value from a DefElem's arg.
+/// If arg is None (bare keyword like HEADER), returns None (caller defaults to true).
+fn def_elem_bool_val(def: &pg_query::protobuf::DefElem) -> Option<bool> {
+    let arg = def.arg.as_deref()?;
+    match &arg.node {
+        Some(pg_query::protobuf::node::Node::Integer(i)) => Some(i.ival != 0),
+        Some(pg_query::protobuf::node::Node::String(s)) => Some(matches!(
+            s.sval.to_lowercase().as_str(),
+            "true" | "on" | "1"
+        )),
+        _ => None,
+    }
+}
+
+/// Result of mapping a PostgreSQL type: the Turso type name, array dimensions,
+/// and type parameters (e.g. `[4]` for `varchar(4)`, `[10, 2]` for `numeric(10, 2)`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PgTypeMapping {
     pub type_name: String,
     pub array_dimensions: u32,
+    pub type_params: Vec<i64>,
 }
 
 impl PgTypeMapping {
@@ -3333,6 +3555,15 @@ impl PgTypeMapping {
         Self {
             type_name: name.into(),
             array_dimensions: 0,
+            type_params: vec![],
+        }
+    }
+
+    pub fn with_params(name: impl Into<String>, params: Vec<i64>) -> Self {
+        Self {
+            type_name: name.into(),
+            array_dimensions: 0,
+            type_params: params,
         }
     }
 
@@ -3340,6 +3571,7 @@ impl PgTypeMapping {
         Self {
             type_name: name.into(),
             array_dimensions: dims,
+            type_params: vec![],
         }
     }
 }
@@ -3366,6 +3598,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         return Some(PgTypeMapping {
             type_name: scalar.type_name,
             array_dimensions: scalar.array_dimensions + dims,
+            type_params: scalar.type_params,
         });
     }
 
@@ -3384,16 +3617,20 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "JSON" => "json".into(),
         "JSONB" => "jsonb".into(),
 
-        // Parametric types
-        "VARCHAR" | "CHAR" => match params.first() {
-            Some(&n) => format!("varchar({n})"),
-            None => "TEXT".into(),
-        },
-        "NUMERIC" | "DECIMAL" => match params {
-            [p, s] => format!("numeric({p},{s})"),
-            [p] => format!("numeric({p},0)"),
-            _ => "REAL".into(),
-        },
+        // Parametric types — return base name + params separately
+        "VARCHAR" | "CHAR" => {
+            return match params.first() {
+                Some(_) => Some(PgTypeMapping::with_params("varchar", params.to_vec())),
+                None => Some(PgTypeMapping::scalar("TEXT")),
+            };
+        }
+        "NUMERIC" | "DECIMAL" => {
+            return match params {
+                [p, s] => Some(PgTypeMapping::with_params("numeric", vec![*p, *s])),
+                [p] => Some(PgTypeMapping::with_params("numeric", vec![*p, 0])),
+                _ => Some(PgTypeMapping::scalar("REAL")),
+            };
+        }
 
         // Base types (no Turso custom type needed)
         "INTEGER" | "INT" | "INT4" | "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" => "INTEGER".into(),
@@ -3423,6 +3660,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     Some(PgTypeMapping {
         type_name,
         array_dimensions: 0,
+        type_params: vec![],
     })
 }
 
@@ -3807,6 +4045,97 @@ pub fn is_refresh_matview(parse_result: &ParseResult) -> bool {
     matches!(&nodes[0].0, NodeRef::RefreshMatViewStmt(_))
 }
 
+/// Extracted COPY FROM statement info for use by the connection layer.
+#[derive(Debug, Clone)]
+pub struct PgCopyFromStmt {
+    pub table_name: String,
+    pub schema_name: Option<String>,
+    pub columns: Option<Vec<String>>,
+    pub filename: String,
+    pub delimiter: Option<String>,
+    pub header: bool,
+    pub null_string: Option<String>,
+}
+
+/// Try to extract a COPY FROM file statement from pg_query parse output.
+/// Returns None if the statement is not a COPY FROM with a filename.
+pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::CopyStmt(copy) = &nodes[0].0 else {
+        return None;
+    };
+
+    // Only handle COPY FROM with a file path (not STDIN, not COPY TO)
+    if !copy.is_from || copy.filename.is_empty() || copy.is_program {
+        return None;
+    }
+
+    let relation = copy.relation.as_ref()?;
+    let table_name = relation.relname.clone();
+    let schema_name = if relation.schemaname.is_empty()
+        || matches!(
+            relation.schemaname.to_lowercase().as_str(),
+            "public" | "pg_catalog"
+        ) {
+        None
+    } else {
+        Some(relation.schemaname.clone())
+    };
+
+    let columns = if copy.attlist.is_empty() {
+        None
+    } else {
+        let cols: Vec<String> = copy
+            .attlist
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect();
+        Some(cols)
+    };
+
+    let mut delimiter = None;
+    let mut header = false;
+    let mut null_string = None;
+
+    for opt in &copy.options {
+        let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
+            continue;
+        };
+        match def.defname.as_str() {
+            "format" => {
+                // Only support text format for now
+                if let Some(val) = def_elem_string_val(def) {
+                    if val.to_lowercase() != "text" {
+                        return None; // unsupported format
+                    }
+                }
+            }
+            "delimiter" => delimiter = def_elem_string_val(def),
+            "header" => header = def_elem_bool_val(def).unwrap_or(true),
+            "null" => null_string = def_elem_string_val(def),
+            _ => {}
+        }
+    }
+
+    Some(PgCopyFromStmt {
+        table_name,
+        schema_name,
+        columns,
+        filename: copy.filename.clone(),
+        delimiter,
+        header,
+        null_string,
+    })
+}
+
 /// Parse a SQL referential action string to an AST RefAct.
 fn parse_ref_act(action: &str) -> Option<ast::RefAct> {
     match action.to_uppercase().as_str() {
@@ -4023,11 +4352,20 @@ mod tests {
         assert_eq!(map_pg_type("JSON", no_params), Some(s("json")));
         assert_eq!(map_pg_type("JSONB", no_params), Some(s("jsonb")));
 
-        // Parametric types
-        assert_eq!(map_pg_type("VARCHAR", &[100]), Some(s("varchar(100)")));
+        // Parametric types — base name + params separated
+        assert_eq!(
+            map_pg_type("VARCHAR", &[100]),
+            Some(PgTypeMapping::with_params("varchar", vec![100]))
+        );
         assert_eq!(map_pg_type("VARCHAR", no_params), Some(s("TEXT")));
-        assert_eq!(map_pg_type("NUMERIC", &[10, 2]), Some(s("numeric(10,2)")));
-        assert_eq!(map_pg_type("NUMERIC", &[10]), Some(s("numeric(10,0)")));
+        assert_eq!(
+            map_pg_type("NUMERIC", &[10, 2]),
+            Some(PgTypeMapping::with_params("numeric", vec![10, 2]))
+        );
+        assert_eq!(
+            map_pg_type("NUMERIC", &[10]),
+            Some(PgTypeMapping::with_params("numeric", vec![10, 0]))
+        );
         assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("REAL")));
 
         // Network types → custom types
@@ -4051,6 +4389,72 @@ mod tests {
             map_pg_type("SOMECUSTOMTYPE", no_params),
             Some(s("somecustomtype"))
         );
+    }
+
+    #[test]
+    fn test_varchar_column_type() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE TABLE t(f1 varchar(4))";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        if let ast::Stmt::CreateTable { body, .. } = &stmt {
+            if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let col = &columns[0];
+                let col_type = col.col_type.as_ref().unwrap();
+                assert_eq!(col_type.name, "varchar");
+                assert!(
+                    matches!(col_type.size, Some(ast::TypeSize::MaxSize(_))),
+                    "expected MaxSize, got {:?}",
+                    col_type.size
+                );
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable, got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_numeric_column_type() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE TABLE t(f1 numeric(10, 2))";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        if let ast::Stmt::CreateTable { body, .. } = &stmt {
+            if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let col = &columns[0];
+                let col_type = col.col_type.as_ref().unwrap();
+                assert_eq!(col_type.name, "numeric");
+                assert!(
+                    matches!(col_type.size, Some(ast::TypeSize::TypeSize(_, _))),
+                    "expected TypeSize, got {:?}",
+                    col_type.size
+                );
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable, got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_unary_plus() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT +42";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        assert!(matches!(stmt, ast::Stmt::Select(_)));
+    }
+
+    #[test]
+    fn test_unary_minus() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT -42";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        assert!(matches!(stmt, ast::Stmt::Select(_)));
     }
 
     #[test]
@@ -5997,5 +6401,154 @@ mod tests {
                 assert!(window_clause[0].window.frame_clause.is_none());
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // COPY statement translation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_copy_from_file() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "COPY users FROM '/path/to/file.tsv'";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::Copy {
+                table_name,
+                columns,
+                direction,
+                target,
+                format,
+                delimiter,
+                header,
+                ..
+            } => {
+                assert_eq!(table_name.name.as_str(), "users");
+                assert!(columns.is_none());
+                assert_eq!(direction, ast::CopyDirection::From);
+                assert_eq!(target, ast::CopyTarget::File("/path/to/file.tsv".into()));
+                assert_eq!(format, ast::CopyFormat::Text);
+                assert!(delimiter.is_none());
+                assert!(!header);
+            }
+            other => panic!("Expected Copy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_copy_from_with_columns() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "COPY users (id, name) FROM '/path/to/file.tsv'";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::Copy {
+                columns, direction, ..
+            } => {
+                assert_eq!(direction, ast::CopyDirection::From);
+                let cols = columns.unwrap();
+                assert_eq!(cols.len(), 2);
+                assert_eq!(cols[0].as_str(), "id");
+                assert_eq!(cols[1].as_str(), "name");
+            }
+            other => panic!("Expected Copy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_copy_from_csv_options() {
+        let translator = PostgreSQLTranslator::new();
+        let sql =
+            "COPY users FROM '/path' WITH (FORMAT csv, DELIMITER ',', HEADER true, NULL 'NA')";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::Copy {
+                format,
+                delimiter,
+                header,
+                null_string,
+                ..
+            } => {
+                assert_eq!(format, ast::CopyFormat::Csv);
+                assert_eq!(delimiter, Some(",".into()));
+                assert!(header);
+                assert_eq!(null_string, Some("NA".into()));
+            }
+            other => panic!("Expected Copy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_copy_from_stdin() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "COPY users FROM STDIN";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::Copy {
+                direction, target, ..
+            } => {
+                assert_eq!(direction, ast::CopyDirection::From);
+                assert_eq!(target, ast::CopyTarget::Stdin);
+            }
+            other => panic!("Expected Copy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_copy_to_file() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "COPY users TO '/path/to/output.csv'";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::Copy {
+                direction, target, ..
+            } => {
+                assert_eq!(direction, ast::CopyDirection::To);
+                assert_eq!(target, ast::CopyTarget::File("/path/to/output.csv".into()));
+            }
+            other => panic!("Expected Copy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_extract_copy_from() {
+        let parsed = crate::parse("COPY users FROM '/tmp/data.tsv'").unwrap();
+        let copy = try_extract_copy_from(&parsed).unwrap();
+        assert_eq!(copy.table_name, "users");
+        assert!(copy.schema_name.is_none());
+        assert!(copy.columns.is_none());
+        assert_eq!(copy.filename, "/tmp/data.tsv");
+        assert!(!copy.header);
+        assert!(copy.delimiter.is_none());
+        assert!(copy.null_string.is_none());
+    }
+
+    #[test]
+    fn test_try_extract_copy_from_not_to() {
+        let parsed = crate::parse("COPY users TO '/tmp/out.tsv'").unwrap();
+        assert!(try_extract_copy_from(&parsed).is_none());
+    }
+
+    #[test]
+    fn test_try_extract_copy_from_not_stdin() {
+        let parsed = crate::parse("COPY users FROM STDIN").unwrap();
+        assert!(try_extract_copy_from(&parsed).is_none());
+    }
+
+    #[test]
+    fn test_try_extract_copy_from_with_columns() {
+        let parsed = crate::parse("COPY users (id, name) FROM '/tmp/data.tsv'").unwrap();
+        let copy = try_extract_copy_from(&parsed).unwrap();
+        let cols = copy.columns.unwrap();
+        assert_eq!(cols, vec!["id", "name"]);
     }
 }

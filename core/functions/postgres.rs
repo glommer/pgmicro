@@ -141,6 +141,188 @@ pub fn exec_lpad(input: &Value, length: usize, fill: &str) -> Value {
     }
 }
 
+fn gcd_inner(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a.wrapping_abs()
+}
+
+/// Greatest common divisor.
+pub fn exec_gcd(a: i64, b: i64) -> Value {
+    // PG raises ERROR on overflow (gcd(INT_MIN, 0)), we match that
+    if (a == i64::MIN && b == 0) || (b == i64::MIN && a == 0) {
+        return Value::build_text("ERROR: integer out of range");
+    }
+    if a == i64::MIN && b == i64::MIN {
+        return Value::build_text("ERROR: integer out of range");
+    }
+    Value::from_i64(gcd_inner(a, b))
+}
+
+/// Least common multiple.
+pub fn exec_lcm(a: i64, b: i64) -> Value {
+    if a == 0 || b == 0 {
+        return Value::from_i64(0);
+    }
+    let g = gcd_inner(a, b);
+    match (a / g).checked_mul(b.wrapping_abs()) {
+        Some(v) => Value::from_i64(v.wrapping_abs()),
+        None => Value::build_text("ERROR: integer out of range"),
+    }
+}
+
+/// Repeat a string n times.
+pub fn exec_repeat(input: &Value, count: i64) -> Value {
+    let s = match input {
+        Value::Text(t) => t.as_str(),
+        Value::Null => return Value::Null,
+        _ => return Value::Null,
+    };
+    if count <= 0 {
+        return Value::build_text(String::new());
+    }
+    Value::build_text(s.repeat(count as usize))
+}
+
+/// Simplified to_char: formats a number with the given format pattern.
+/// Supports basic PG numeric format patterns (9, 0, S, MI, FM, D, G, PR, TH, L).
+pub fn exec_to_char(value: &Value, format: &str) -> Value {
+    let num = match value {
+        Value::Null => return Value::Null,
+        Value::Numeric(_) => value.as_float(),
+        Value::Text(t) => match t.as_str().parse::<f64>() {
+            Ok(f) => f,
+            Err(_) => return Value::Null,
+        },
+        _ => return Value::Null,
+    };
+
+    let result = pg_to_char_numeric(num, format);
+    Value::build_text(result)
+}
+
+/// pg_input_is_valid(text, type) → boolean
+/// Returns true if the text is valid input for the given type.
+pub fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Value {
+    let s = match input {
+        Value::Text(t) => t.as_str().to_string(),
+        Value::Null => return Value::Null,
+        v => v.to_string(),
+    };
+    let valid = crate::pg_catalog::validate_pg_input(&s, type_name).is_none();
+    Value::from_i64(if valid { 1 } else { 0 })
+}
+
+/// Format a number using PG's to_char numeric format patterns.
+fn pg_to_char_numeric(num: f64, format: &str) -> String {
+    let is_negative = num < 0.0;
+    let abs_num = num.abs();
+
+    // Parse format string for flags
+    let upper_fmt = format.to_uppercase();
+    let fm = upper_fmt.contains("FM"); // fill mode (suppress padding)
+    let has_pr = upper_fmt.contains("PR"); // angle brackets for negative
+    let has_s = upper_fmt.contains('S'); // sign
+    let has_mi = upper_fmt.starts_with("MI") || upper_fmt.ends_with("MI");
+
+    // Count digit positions
+    let mut integer_digits = 0;
+    let mut decimal_digits = 0;
+    let mut leading_zeros = 0;
+    let mut seen_dot = false;
+
+    for ch in upper_fmt.chars() {
+        match ch {
+            '9' => {
+                if seen_dot {
+                    decimal_digits += 1;
+                } else {
+                    integer_digits += 1;
+                }
+            }
+            '0' => {
+                if seen_dot {
+                    decimal_digits += 1;
+                } else {
+                    integer_digits += 1;
+                    leading_zeros += 1;
+                }
+            }
+            'D' | '.' => seen_dot = true,
+            _ => {}
+        }
+    }
+
+    if integer_digits == 0 && decimal_digits == 0 {
+        return format!("{num}");
+    }
+
+    // Format the number
+    let formatted = if decimal_digits > 0 {
+        let prec = decimal_digits;
+        format!("{abs_num:.prec$}")
+    } else {
+        let int_val = abs_num as i64;
+        format!("{int_val}")
+    };
+
+    // Split into integer and decimal parts
+    let parts: Vec<&str> = formatted.split('.').collect();
+    let int_part = parts[0];
+    let dec_part = if parts.len() > 1 { parts[1] } else { "" };
+
+    // Pad integer part
+    let padded_int = if !fm {
+        let width = integer_digits.max(int_part.len());
+        if leading_zeros > 0 {
+            format!("{int_part:0>width$}")
+        } else {
+            format!("{int_part:>width$}")
+        }
+    } else {
+        int_part.to_string()
+    };
+
+    // Build result
+    let mut result = if decimal_digits > 0 {
+        format!("{padded_int}.{dec_part}")
+    } else {
+        padded_int
+    };
+
+    // Add sign
+    if has_pr {
+        result = if is_negative {
+            format!("<{result}>")
+        } else {
+            format!(" {result} ")
+        };
+    } else if has_s {
+        let sign_pos = upper_fmt.find('S').unwrap_or(0);
+        let sign = if is_negative { "-" } else { "+" };
+        if sign_pos == 0 {
+            result = format!("{sign}{result}");
+        } else {
+            result = format!("{result}{sign}");
+        }
+    } else if has_mi {
+        if is_negative {
+            result = format!("{result}-");
+        } else {
+            result = format!("{result} ");
+        }
+    } else if is_negative {
+        result = format!("-{result}");
+    } else {
+        result = format!(" {result}");
+    }
+
+    result
+}
+
 pub fn exec_rpad(input: &Value, length: usize, fill: &str) -> Value {
     let s = match input {
         Value::Text(t) => t.to_string(),

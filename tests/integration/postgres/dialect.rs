@@ -2813,3 +2813,503 @@ fn test_postgres_default_casted_expression(db: TempDatabase) {
     };
     assert_eq!(name.value, "unnamed");
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_delete_with_alias(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE del_test (id INTEGER PRIMARY KEY, a INT)")
+        .unwrap();
+    conn.execute("INSERT INTO del_test VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO del_test VALUES (2, 50)").unwrap();
+    conn.execute("INSERT INTO del_test VALUES (3, 100)")
+        .unwrap();
+
+    // DELETE with alias — WHERE references the alias
+    conn.execute("DELETE FROM del_test AS dt WHERE dt.a > 75")
+        .unwrap();
+
+    let mut rows = conn
+        .query("SELECT id, a FROM del_test ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(row.get_value(0).to_string(), "1");
+    assert_eq!(row.get_value(1).to_string(), "10");
+
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected second row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(row.get_value(0).to_string(), "2");
+    assert_eq!(row.get_value(1).to_string(), "50");
+
+    let StepResult::Done = rows.step().unwrap() else {
+        panic!("expected done after two rows");
+    };
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_update_with_alias(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE upd_test (id INTEGER PRIMARY KEY, a INT)")
+        .unwrap();
+    conn.execute("INSERT INTO upd_test VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO upd_test VALUES (2, 50)").unwrap();
+
+    // UPDATE with alias — SET and WHERE reference the alias
+    conn.execute("UPDATE upd_test AS ut SET a = ut.a + 1 WHERE ut.id = 1")
+        .unwrap();
+
+    let mut rows = conn
+        .query("SELECT a FROM upd_test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "11");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_booleq_boolne(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE booltbl (f1 INTEGER)").unwrap();
+    conn.execute("INSERT INTO booltbl VALUES (1)").unwrap();
+    conn.execute("INSERT INTO booltbl VALUES (0)").unwrap();
+    conn.execute("INSERT INTO booltbl VALUES (1)").unwrap();
+
+    // booleq: select rows where f1 equals 0 (false)
+    let mut rows = conn
+        .query("SELECT f1 FROM booltbl WHERE booleq(0, f1)")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "0");
+    let StepResult::Done = rows.step().unwrap() else {
+        panic!("expected done");
+    };
+    drop(rows);
+
+    // boolne: select rows where f1 is not equal to 0
+    let mut rows = conn
+        .query("SELECT f1 FROM booltbl WHERE boolne(f1, 0)")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected second row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    let StepResult::Done = rows.step().unwrap() else {
+        panic!("expected done");
+    };
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_pg_input_error_info(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    // Invalid boolean input → error row with message and sql_error_code
+    let mut rows = conn
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('junk', 'bool')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "invalid input syntax for type boolean: \"junk\""
+    );
+    assert_eq!(row.get_value(1).to_string(), "22P02");
+    let StepResult::Done = rows.step().unwrap() else {
+        panic!("expected done");
+    };
+    drop(rows);
+
+    // Out-of-range int4 → error with 22003 code
+    let mut rows = conn
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('1000000000000', 'int4')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "value \"1000000000000\" is out of range for type integer"
+    );
+    assert_eq!(row.get_value(1).to_string(), "22003");
+    let StepResult::Done = rows.step().unwrap() else {
+        panic!("expected done");
+    };
+    drop(rows);
+
+    // Out-of-range int8 → error with 22003 code
+    let mut rows = conn
+        .query(
+            "SELECT message, sql_error_code FROM pg_input_error_info('10000000000000000000', 'int8')",
+        )
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "value \"10000000000000000000\" is out of range for type bigint"
+    );
+    assert_eq!(row.get_value(1).to_string(), "22003");
+    let StepResult::Done = rows.step().unwrap() else {
+        panic!("expected done");
+    };
+    drop(rows);
+
+    // Valid input → all NULLs
+    let mut rows = conn
+        .query(
+            "SELECT message, detail, hint, sql_error_code FROM pg_input_error_info('123', 'int4')",
+        )
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert!(matches!(row.get_value(0), Value::Null));
+    assert!(matches!(row.get_value(1), Value::Null));
+    assert!(matches!(row.get_value(2), Value::Null));
+    assert!(matches!(row.get_value(3), Value::Null));
+    let StepResult::Done = rows.step().unwrap() else {
+        panic!("expected done");
+    };
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_input_error_info_float_overflow(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    // float4: 1e400 parses as infinity in Rust, but PG treats it as out-of-range
+    let mut rows = conn
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('1e400', 'float4')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "value \"1e400\" is out of range for type real"
+    );
+    assert_eq!(row.get_value(1).to_string(), "22003");
+    drop(rows);
+
+    // float8: 1e4000 out-of-range
+    let mut rows = conn
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('1e4000', 'float8')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "value \"1e4000\" is out of range for type double precision"
+    );
+    assert_eq!(row.get_value(1).to_string(), "22003");
+    drop(rows);
+
+    // float4: valid
+    let mut rows = conn
+        .query("SELECT pg_input_is_valid('3.14', 'float4')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    drop(rows);
+
+    // float4: invalid syntax
+    let mut rows = conn
+        .query("SELECT pg_input_is_valid('xyz', 'float4')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "0");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_input_error_info_extended_types(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    // numeric: invalid
+    let mut rows = conn
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('not_a_number', 'numeric')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "invalid input syntax for type numeric: \"not_a_number\""
+    );
+    assert_eq!(row.get_value(1).to_string(), "22P02");
+    drop(rows);
+
+    // numeric: valid
+    let mut rows = conn
+        .query("SELECT pg_input_is_valid('123.456', 'numeric')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    drop(rows);
+
+    // uuid: invalid
+    let mut rows = conn
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('11', 'uuid')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "invalid input syntax for type uuid: \"11\""
+    );
+    assert_eq!(row.get_value(1).to_string(), "22P02");
+    drop(rows);
+
+    // uuid: valid
+    let mut rows = conn
+        .query("SELECT pg_input_is_valid('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'uuid')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    drop(rows);
+
+    // varchar(4): too long → 22001
+    let mut rows = conn
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('abcde', 'varchar(4)')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "value too long for type character varying(4)"
+    );
+    assert_eq!(row.get_value(1).to_string(), "22001");
+    drop(rows);
+
+    // varchar(4): valid
+    let mut rows = conn
+        .query("SELECT pg_input_is_valid('abcd', 'varchar(4)')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    drop(rows);
+
+    // date: invalid
+    let mut rows = conn
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('not-a-date', 'date')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "invalid input syntax for type date: \"not-a-date\""
+    );
+    assert_eq!(row.get_value(1).to_string(), "22007");
+    drop(rows);
+
+    // date: valid
+    let mut rows = conn
+        .query("SELECT pg_input_is_valid('2024-01-15', 'date')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    drop(rows);
+
+    // timestamp: invalid
+    let mut rows = conn
+        .query(
+            "SELECT message, sql_error_code FROM pg_input_error_info('not-a-timestamp', 'timestamp')",
+        )
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "invalid input syntax for type timestamp: \"not-a-timestamp\""
+    );
+    assert_eq!(row.get_value(1).to_string(), "22007");
+    drop(rows);
+
+    // timestamp: valid
+    let mut rows = conn
+        .query("SELECT pg_input_is_valid('2024-01-15 10:30:00', 'timestamp')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    drop(rows);
+
+    // json: invalid
+    let mut rows = conn
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('not json', 'json')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "invalid input syntax for type json: \"not json\""
+    );
+    assert_eq!(row.get_value(1).to_string(), "22P02");
+    drop(rows);
+
+    // json: valid
+    let mut rows = conn
+        .query("SELECT pg_input_is_valid('{\"key\": \"value\"}', 'json')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    drop(rows);
+
+    // unknown type: error
+    let mut rows = conn
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('x', 'nonexistent_type')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(
+        row.get_value(0).to_string(),
+        "type \"nonexistent_type\" does not exist"
+    );
+    assert_eq!(row.get_value(1).to_string(), "42704");
+    drop(rows);
+
+    // oid: valid
+    let mut rows = conn
+        .query("SELECT pg_input_is_valid('12345', 'oid')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    drop(rows);
+
+    // oid: invalid
+    let mut rows = conn
+        .query("SELECT pg_input_is_valid('not_oid', 'oid')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "0");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_catalog_dml_rejection(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    // INSERT into pg_catalog table should produce a clear error
+    let err = conn
+        .execute("INSERT INTO pg_input_error_info VALUES ('a', 'b', 'c', 'd')")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot insert into pg_catalog table"),
+        "unexpected error: {err}"
+    );
+
+    // INSERT into pg_class should also be rejected
+    let err = conn
+        .execute("INSERT INTO pg_class (oid, relname) VALUES (1, 'test')")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot insert into pg_catalog table"),
+        "unexpected error: {err}"
+    );
+
+    // DELETE from pg_catalog table
+    let err = conn
+        .execute("DELETE FROM pg_type WHERE oid = 1")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot delete from pg_catalog table"),
+        "unexpected error: {err}"
+    );
+
+    // UPDATE pg_catalog table
+    let err = conn
+        .execute("UPDATE pg_namespace SET nspname = 'x' WHERE oid = 1")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot update pg_catalog table"),
+        "unexpected error: {err}"
+    );
+}
