@@ -13,7 +13,6 @@ use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
-use crate::functions::datetime;
 use crate::schema::{ColDef, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef};
 use crate::sync::Arc;
 use crate::translate::expression_index::{
@@ -6424,33 +6423,42 @@ pub fn emit_literal(
             Ok(target_register)
         }
         ast::Literal::CurrentDate => {
-            program.emit_insn(Insn::String8 {
-                value: datetime::exec_date::<&[_; 0], std::slice::Iter<'_, Value>, &Value>(&[])
-                    .to_string(),
+            let start_reg = program.alloc_register();
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg,
                 dest: target_register,
+                func: FuncCtx {
+                    func: Func::Scalar(ScalarFunc::Date),
+                    arg_count: 0,
+                },
             });
             Ok(target_register)
         }
         ast::Literal::CurrentTime => {
-            program.emit_insn(Insn::String8 {
-                value: datetime::exec_time::<&[_; 0], std::slice::Iter<'_, Value>, &Value>(&[])
-                    .to_string(),
+            let start_reg = program.alloc_register();
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg,
                 dest: target_register,
+                func: FuncCtx {
+                    func: Func::Scalar(ScalarFunc::Time),
+                    arg_count: 0,
+                },
             });
             Ok(target_register)
         }
         ast::Literal::CurrentTimestamp => {
-            program.emit_insn(
-                Insn::String8 {
-                    value: datetime::exec_datetime_full::<
-                        &[_; 0],
-                        std::slice::Iter<'_, Value>,
-                        &Value,
-                    >(&[])
-                    .to_string(),
-                    dest: target_register,
+            let start_reg = program.alloc_register();
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg,
+                dest: target_register,
+                func: FuncCtx {
+                    func: Func::Scalar(ScalarFunc::DateTime),
+                    arg_count: 0,
                 },
-            );
+            });
             Ok(target_register)
         }
     }

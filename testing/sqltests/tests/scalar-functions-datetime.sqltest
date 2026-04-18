@@ -2454,3 +2454,47 @@ test strftime-format-bool-false {
 expect {
     0
 }
+
+test current-timestamp-returns-datetime-format {
+    SELECT length(CURRENT_TIMESTAMP) = 19;
+}
+expect {
+    1
+}
+
+test current-date-returns-date-format {
+    SELECT length(CURRENT_DATE) = 10;
+}
+expect {
+    1
+}
+
+test current-time-returns-time-format {
+    SELECT length(CURRENT_TIME) = 8;
+}
+expect {
+    1
+}
+
+test now-function-returns-datetime-format {
+    SELECT length(now()) = 19;
+}
+expect {
+    1
+}
+
+test current-timestamp-matches-datetime {
+    SELECT CURRENT_TIMESTAMP = datetime('now');
+}
+expect {
+    1
+}
+
+test current-timestamp-in-insert {
+    CREATE TABLE ts_test (id INTEGER PRIMARY KEY, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+    INSERT INTO ts_test (id) VALUES (1);
+    SELECT length(created_at) = 19 FROM ts_test WHERE id = 1;
+}
+expect {
+    1
+}
