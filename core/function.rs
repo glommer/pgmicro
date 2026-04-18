@@ -565,6 +565,9 @@ pub enum ScalarFunc {
     ToChar,
     // PostgreSQL input validation
     PgInputIsValid,
+    // PostgreSQL boolean operator functions
+    BoolEq,
+    BoolNe,
 }
 
 impl Deterministic for ScalarFunc {
@@ -690,7 +693,9 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::Lcm
             | ScalarFunc::Repeat
             | ScalarFunc::ToChar
-            | ScalarFunc::PgInputIsValid => true,
+            | ScalarFunc::PgInputIsValid
+            | ScalarFunc::BoolEq
+            | ScalarFunc::BoolNe => true,
         }
     }
 }
@@ -842,6 +847,8 @@ impl Display for ScalarFunc {
             Self::Repeat => "repeat",
             Self::ToChar => "to_char",
             Self::PgInputIsValid => "pg_input_is_valid",
+            Self::BoolEq => "booleq",
+            Self::BoolNe => "boolne",
         };
         write!(f, "{str}")
     }
@@ -990,7 +997,13 @@ impl ScalarFunc {
             Self::ArraySlice => &[3],
             Self::StringToArray => &[2, 3],
             Self::ArrayToString => &[2, 3],
-            Self::Gcd | Self::Lcm | Self::Repeat | Self::ToChar | Self::PgInputIsValid => &[2],
+            Self::Gcd
+            | Self::Lcm
+            | Self::Repeat
+            | Self::ToChar
+            | Self::PgInputIsValid
+            | Self::BoolEq
+            | Self::BoolNe => &[2],
         }
     }
 
@@ -1376,6 +1389,8 @@ impl Func {
             "repeat" => Ok(Some(Self::Scalar(ScalarFunc::Repeat))),
             "to_char" => Ok(Some(Self::Scalar(ScalarFunc::ToChar))),
             "pg_input_is_valid" => Ok(Some(Self::Scalar(ScalarFunc::PgInputIsValid))),
+            "booleq" => Ok(Some(Self::Scalar(ScalarFunc::BoolEq))),
+            "boolne" => Ok(Some(Self::Scalar(ScalarFunc::BoolNe))),
             "abs" => Ok(Some(Self::Scalar(ScalarFunc::Abs))),
             "upper" => Ok(Some(Self::Scalar(ScalarFunc::Upper))),
             "lower" => Ok(Some(Self::Scalar(ScalarFunc::Lower))),

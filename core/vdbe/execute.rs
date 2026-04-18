@@ -6621,6 +6621,18 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(exec_pg_input_is_valid(input, &type_name));
             }
+            ScalarFunc::BoolEq => {
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                let eq = a == b;
+                state.registers[*dest].set_value(Value::from_i64(if eq { 1 } else { 0 }));
+            }
+            ScalarFunc::BoolNe => {
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                let ne = a != b;
+                state.registers[*dest].set_value(Value::from_i64(if ne { 1 } else { 0 }));
+            }
             ScalarFunc::Abs
             | ScalarFunc::Lower
             | ScalarFunc::Upper

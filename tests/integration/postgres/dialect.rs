@@ -2876,3 +2876,45 @@ fn test_postgres_update_with_alias(db: TempDatabase) {
     };
     assert_eq!(rows.row().unwrap().get_value(0).to_string(), "11");
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_booleq_boolne(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE booltbl (f1 INTEGER)").unwrap();
+    conn.execute("INSERT INTO booltbl VALUES (1)").unwrap();
+    conn.execute("INSERT INTO booltbl VALUES (0)").unwrap();
+    conn.execute("INSERT INTO booltbl VALUES (1)").unwrap();
+
+    // booleq: select rows where f1 equals 0 (false)
+    let mut rows = conn
+        .query("SELECT f1 FROM booltbl WHERE booleq(0, f1)")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "0");
+    let StepResult::Done = rows.step().unwrap() else {
+        panic!("expected done");
+    };
+    drop(rows);
+
+    // boolne: select rows where f1 is not equal to 0
+    let mut rows = conn
+        .query("SELECT f1 FROM booltbl WHERE boolne(f1, 0)")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected second row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    let StepResult::Done = rows.step().unwrap() else {
+        panic!("expected done");
+    };
+}
