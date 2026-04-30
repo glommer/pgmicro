@@ -1123,7 +1123,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -1195,7 +1195,7 @@ impl Connection {
                     .unwrap()
                     .trim();
                 let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+                Statement::new(program, pager, mode, 0).run_ignore_rows()?;
             }
             return Ok(());
         }

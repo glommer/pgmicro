@@ -11414,7 +11414,7 @@ pub fn op_init_cdc_version(
         insn
     );
 
-    let conn = program.connection.clone();
+    let conn = &program.connection;
     let escaped_cdc_table_name = escape_sql_string_literal(cdc_table_name);
 
     // First entry — handle no-op cases without spinning up the state machine,
@@ -11438,7 +11438,7 @@ pub fn op_init_cdc_version(
         }
 
         let stmt = prepare_cdc_internal(
-            &conn,
+            conn,
             format!(
                 "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
             ),
@@ -11453,7 +11453,7 @@ pub fn op_init_cdc_version(
 
     let res = drive_init_cdc_version(
         state,
-        &conn,
+        conn,
         version,
         cdc_mode,
         cdc_table_name,
@@ -11512,12 +11512,12 @@ fn drive_init_cdc_version(
                             "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                     };
-                    inner.stmt = prepare_cdc_internal(&conn, create_sql)?;
+                    inner.stmt = prepare_cdc_internal(conn, create_sql)?;
                     inner.phase = OpInitCdcVersionPhase::CreateCdcTable;
                 }
                 OpInitCdcVersionPhase::CreateCdcTable => {
                     inner.stmt = prepare_cdc_internal(
-                        &conn,
+                        conn,
                         format!(
                             "CREATE TABLE IF NOT EXISTS {TURSO_CDC_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
                         ),
@@ -11534,7 +11534,7 @@ fn drive_init_cdc_version(
                         *version
                     };
                     inner.stmt = prepare_cdc_internal(
-                        &conn,
+                        conn,
                         format!(
                             "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
                         ),
@@ -11543,7 +11543,7 @@ fn drive_init_cdc_version(
                 }
                 OpInitCdcVersionPhase::InsertVersion => {
                     inner.stmt = prepare_cdc_internal(
-                        &conn,
+                        conn,
                         format!(
                             "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
                         ),
