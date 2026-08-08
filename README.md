@@ -2,6 +2,37 @@
   <img src="pgmicro-logo.png" alt="pgmicro" width="600"/>
 </p>
 
+# pgmicro is now part of Turso
+
+> [!IMPORTANT]
+> **This experiment succeeded — and graduated.** pgmicro has been merged into
+> [Turso](https://github.com/tursodatabase/turso), and Postgres support is now
+> developed in-tree as an official Turso project. This repository is preserved
+> for historical reference and is no longer where development happens.
+
+pgmicro started as a question: instead of compiling PostgreSQL to WebAssembly
+or translating its SQL to SQLite text, could we parse the PostgreSQL language
+with PostgreSQL's own parser and compile it directly to SQLite bytecode, on
+top of a modern Rust engine? The answer turned out to be yes — well enough
+that Turso decided to put its weight behind it.
+
+The story is told in two blog posts:
+
+- [**A new, modern version of Postgres, in Rust**](https://turso.tech/blog/a-new-modern-version-of-postgres-in-rust)
+  — how the pgmicro experiment worked, why it succeeded, and the announcement
+  that it is now fully merged into the Turso tree.
+- [**Running unmodified Doom in the SQLite bytecode language**](https://turso.tech/blog/running-unmodified-doom-in-the-sqlite-bytecode-language)
+  — where this architecture leads: the bytecode engine underneath pgmicro,
+  extended into a general compilation target — "the LLVM of databases" — far
+  enough to run Doom.
+
+To use it, contribute, or file issues, head to
+[tursodatabase/turso](https://github.com/tursodatabase/turso).
+
+---
+
+The original README follows, unchanged, for historical context.
+
 # pgmicro
 
 An in-process reimplementation of PostgreSQL, backed by a SQLite-compatible storage engine.
